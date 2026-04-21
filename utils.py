@@ -6,6 +6,7 @@ import pandas as pd
 from rdkit import Chem
 from rdkit.Chem.Scaffolds import MurckoScaffold
 from sklearn.model_selection import GroupShuffleSplit
+import numpy as np
 
 
 def detect_smiles_column(df: pd.DataFrame) -> str:
@@ -43,3 +44,8 @@ def stratified_scaffold_split(
     train_df = data.iloc[train_idx].drop(columns=["_scaffold"]).reset_index(drop=True)
     test_df = data.iloc[test_idx].drop(columns=["_scaffold"]).reset_index(drop=True)
     return train_df, test_df
+
+
+def labels_to_int(series: pd.Series) -> np.ndarray:
+    values = series.astype(str).str.lower().str.strip()
+    return values.map(lambda x: 1 if x in {"1", "active", "true", "yes"} else 0).to_numpy(dtype=np.int64)

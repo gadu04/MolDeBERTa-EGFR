@@ -1,183 +1,184 @@
-"""Knowledge Graph Encoder for molecular property prediction."""
+"""KG statistical feature extraction for classification."""
 
 from __future__ import annotations
 
 from typing import Dict, List
 
 import numpy as np
-import pandas as pd
 from neo4j import GraphDatabase
+from rdkit import Chem, DataStructs
+from rdkit.Chem.rdFingerprintGenerator import GetMorganGenerator
 
 from config import CONFIG
 
+_MORGAN_GENERATOR = GetMorganGenerator(radius=2, fpSize=2048)
 
-def _run(session, query: str, params: Dict = None):
+
+def _run(session, query: str, params: Dict | None = None):
     return session.run(query, params or {})
 
 
-def ensure_kg_embeddings():
-    """Compute FastRP embeddings in Neo4j (GDS)."""
-    uri = CONFIG["NEO4J_URI"]
-    user = CONFIG["NEO4J_USER"]
-    pwd = CONFIG["NEO4J_PASSWORD"]
-    dim = CONFIG["KG_EMBED_DIM"]
-    driver = GraphDatabase.driver(uri, auth=(user, pwd))
+def _get_available_labels(session) -> set[str]:
+    rows = _run(session, "CALL db.labels() YIELD label RETURN label")
+    return {str(r["label"]) for r in rows}
+
+
+def _feature_one(session, smiles: str, target_name: str, labels: set[str]) -> List[float]:
+    """
+    Extract 3 robust graph statistical features:
+    - num_warheads
+    - num_moas
+    - has_egfr_path
+    Falls back to 0 when molecule not found/isolated.
+    """
     try:
-        with driver.session() as session:
-            result = _run(session, "CALL gds.graph.exists('egfr_kg') YIELD exists RETURN exists")
-            exists = result.single()["exists"]
-            if exists:
-                _run(
-                    session,
-                    """
-                    CALL gds.graph.drop('egfr_kg')
-                    YIELD graphName
-                    RETURN graphName
-                    """,
-                )
-            _run(
-                session,
-                """
-                CALL gds.graph.project(
-                    'egfr_kg',
-                    ['Molecule','Scaffold','FunctionalGroup','Interaction_Group','Target','MoA'],
-                    {
-                      HAS_SCAFFOLD: {type:'HAS_SCAFFOLD', orientation:'UNDIRECTED'},
-                      HAS_FUNCTIONAL_GROUP: {type:'HAS_FUNCTIONAL_GROUP', orientation:'UNDIRECTED'},
-                      HAS_INTERACTION_GROUP: {type:'HAS_INTERACTION_GROUP', orientation:'UNDIRECTED'},
-                      TESTED_AGAINST: {type:'TESTED_AGAINST', orientation:'UNDIRECTED'},
-                      ACTS_VIA: {type:'ACTS_VIA', orientation:'UNDIRECTED'}
-                    }
-                )
-                """,
-            )
-            _run(
-                session,
-                """
-                CALL gds.fastRP.mutate('egfr_kg', {
-                    embeddingDimension: $dim,
-                    mutateProperty: 'kg_emb',
-                    randomSeed: 42
-                })
-                """,
-                {"dim": dim},
-            )
-            _run(
-                session,
-                """
-                CALL gds.graph.nodeProperties.write('egfr_kg', ['kg_emb'])
-                """,
-            )
-    finally:
-        driver.close()
+        if "Molecule" not in labels:
+            return [0.0, 0.0, 0.0]
 
-
-def fetch_kg_embeddings(smiles_list: List[str]) -> Dict[str, List[float]]:
-    uri = CONFIG["NEO4J_URI"]
-    user = CONFIG["NEO4J_USER"]
-    pwd = CONFIG["NEO4J_PASSWORD"]
-    driver = GraphDatabase.driver(uri, auth=(user, pwd))
-    result: Dict[str, List[float]] = {}
-    try:
-        with driver.session() as session:
-            rows = _run(
-                session,
-                """
-                MATCH (m:Molecule)
-                WHERE m.smiles IN $smiles AND m.kg_emb IS NOT NULL
-                RETURN m.smiles AS smiles, m.kg_emb AS emb
-                """,
-                {"smiles": smiles_list},
-            )
-            for row in rows:
-                if row["emb"] is not None:
-                    result[row["smiles"]] = row["emb"]
-    finally:
-        driver.close()
-    return result
-
-
-def infer_test_embedding_with_injection(smiles: str) -> np.ndarray:
-    uri = CONFIG["NEO4J_URI"]
-    user = CONFIG["NEO4J_USER"]
-    pwd = CONFIG["NEO4J_PASSWORD"]
-    dim = CONFIG["KG_EMBED_DIM"]
-    driver = GraphDatabase.driver(uri, auth=(user, pwd))
-    try:
-        with driver.session() as session:
-            _run(
-                session,
-                """
-                MERGE (m:Molecule {smiles: $smiles})
-                SET m.source = 'TestInference', m.is_virtual = false
-                WITH m
-                MATCH (s:Scaffold)<-[:HAS_SCAFFOLD]-(:Molecule)
-                WITH m, s LIMIT 1
-                MERGE (m)-[:HAS_SCAFFOLD]->(s)
-                WITH m
-                MATCH (t:Target) WITH m, t LIMIT 1
-                MERGE (m)-[:TESTED_AGAINST]->(t)
-                """,
-                {"smiles": smiles},
-            )
-            rows = _run(
-                session,
-                """
-                CALL gds.fastRP.stream('egfr_kg', {embeddingDimension: $dim, randomSeed: 42})
-                YIELD nodeId, embedding
-                WITH gds.util.asNode(nodeId) AS n, embedding
-                WHERE n:Molecule AND n.smiles = $smiles
-                RETURN embedding
-                """,
-                {"smiles": smiles, "dim": dim},
-            )
-            rec = rows.single()
-            emb = np.array(rec["embedding"], dtype=np.float32) if rec and rec["embedding"] is not None else np.zeros((dim,), dtype=np.float32)
-            _run(
+        if "Warhead" in labels:
+            row_w = _run(
                 session,
                 """
                 MATCH (m:Molecule {smiles: $smiles})
-                WHERE m.source = 'TestInference'
-                DETACH DELETE m
+                OPTIONAL MATCH (m)-[]-(w:Warhead)
+                RETURN coalesce(count(DISTINCT w), 0) AS c
                 """,
                 {"smiles": smiles},
-            )
-            return emb
+            ).single()
+            num_warheads = float(int(row_w["c"])) if row_w is not None else 0.0
+        elif "FunctionalGroup" in labels:
+            row_w = _run(
+                session,
+                """
+                MATCH (m:Molecule {smiles: $smiles})
+                OPTIONAL MATCH (m)-[]-(wf:FunctionalGroup)
+                RETURN coalesce(count(DISTINCT wf), 0) AS c
+                """,
+                {"smiles": smiles},
+            ).single()
+            num_warheads = float(int(row_w["c"])) if row_w is not None else 0.0
+        else:
+            num_warheads = 0.0
+
+        if "MoA" in labels and "Interaction_Group" in labels:
+            row_moa = _run(
+                session,
+                """
+                MATCH (m:Molecule {smiles: $smiles})
+                OPTIONAL MATCH (m)-[]-(:Interaction_Group)-[]-(moa:MoA)
+                RETURN coalesce(count(DISTINCT moa), 0) AS c
+                """,
+                {"smiles": smiles},
+            ).single()
+            num_moas = float(int(row_moa["c"])) if row_moa is not None else 0.0
+        elif "MoA" in labels:
+            row_moa = _run(
+                session,
+                """
+                MATCH (m:Molecule {smiles: $smiles})
+                OPTIONAL MATCH (m)-[]-(moa:MoA)
+                RETURN coalesce(count(DISTINCT moa), 0) AS c
+                """,
+                {"smiles": smiles},
+            ).single()
+            num_moas = float(int(row_moa["c"])) if row_moa is not None else 0.0
+        else:
+            num_moas = 0.0
+
+        if "Target" in labels:
+            row_egfr = _run(
+                session,
+                """
+                MATCH (m:Molecule {smiles: $smiles})
+                OPTIONAL MATCH p=(m)-[*1..3]-(:Target {name: $target_name})
+                RETURN CASE WHEN p IS NULL THEN 0 ELSE 1 END AS has_path
+                """,
+                {"smiles": smiles, "target_name": target_name},
+            ).single()
+            has_egfr_path = float(int(row_egfr["has_path"])) if row_egfr is not None else 0.0
+        else:
+            has_egfr_path = 0.0
+        return [num_warheads, num_moas, has_egfr_path]
+    except Exception:
+        return [0.0, 0.0, 0.0]
+
+
+def build_kg_statistical_features(smiles_list: List[str], target_name: str = "EGFR") -> np.ndarray:
+    uri = CONFIG["NEO4J_URI"]
+    user = CONFIG["NEO4J_USER"]
+    pwd = CONFIG["NEO4J_PASSWORD"]
+    driver = GraphDatabase.driver(uri, auth=(user, pwd))
+    out = np.zeros((len(smiles_list), 3), dtype=np.float32)
+    try:
+        with driver.session() as session:
+            labels = _get_available_labels(session)
+            for i, smiles in enumerate(smiles_list):
+                out[i] = np.array(_feature_one(session, str(smiles), target_name, labels), dtype=np.float32)
     finally:
         driver.close()
-
-
-def build_kg_embeddings_for_df(df: pd.DataFrame, smiles_col: str) -> np.ndarray:
-    dim = CONFIG["KG_EMBED_DIM"]
-    smiles_list = df[smiles_col].astype(str).tolist()
-    emb_map = fetch_kg_embeddings(smiles_list)
-    out = np.zeros((len(smiles_list), dim), dtype=np.float32)
-    for i, smiles in enumerate(smiles_list):
-        if smiles in emb_map:
-            out[i] = np.array(emb_map[smiles], dtype=np.float32)
     return out
 
 
-def augment_embeddings_with_kg(
-    nextgen_embeddings: np.ndarray,
-    kg_embeddings: np.ndarray,
-    fusion_type: str = "concat",
+def _fingerprint_or_none(smiles: str):
+    mol = Chem.MolFromSmiles(str(smiles))
+    if mol is None:
+        return None
+    return _MORGAN_GENERATOR.GetFingerprint(mol)
+
+
+def infer_valid_features_by_knn(
+    train_smiles: List[str],
+    train_features: np.ndarray,
+    valid_smiles: List[str],
+    top_k: int = 5,
 ) -> np.ndarray:
-    if fusion_type == "concat":
-        return np.concatenate([nextgen_embeddings, kg_embeddings], axis=1)
-    if fusion_type == "add":
-        if kg_embeddings.shape[1] != nextgen_embeddings.shape[1]:
-            from sklearn.preprocessing import StandardScaler
-            scaler = StandardScaler()
-            kg_scaled = scaler.fit_transform(kg_embeddings)
-            w = np.random.randn(kg_embeddings.shape[1], nextgen_embeddings.shape[1]) * 0.01
-            kg_proj = kg_scaled @ w
-        else:
-            kg_proj = kg_embeddings
-        return nextgen_embeddings + kg_proj
-    if fusion_type == "weighted":
-        kg_scaled = (kg_embeddings - kg_embeddings.mean(axis=0)) / (kg_embeddings.std(axis=0) + 1e-8)
-        kg_scaled = kg_scaled * nextgen_embeddings.std(axis=0)
-        kg_scaled = kg_scaled + nextgen_embeddings.mean(axis=0)
-        return 0.8 * nextgen_embeddings + 0.2 * kg_scaled
-    raise ValueError(f"Unknown fusion_type: {fusion_type}")
+    """
+    Infer valid KG features from Top-K structurally similar train molecules.
+    Uses BulkTanimotoSimilarity for speed.
+    """
+    if len(train_smiles) == 0:
+        return np.zeros((len(valid_smiles), train_features.shape[1] if train_features.ndim == 2 else 3), dtype=np.float32)
+
+    train_fps = [_fingerprint_or_none(s) for s in train_smiles]
+    valid_fps = [_fingerprint_or_none(s) for s in valid_smiles]
+
+    dim = train_features.shape[1]
+    out = np.zeros((len(valid_smiles), dim), dtype=np.float32)
+    nonzero_mask = np.any(train_features != 0, axis=1)
+    global_mean = train_features[nonzero_mask].mean(axis=0) if nonzero_mask.any() else np.zeros((dim,), dtype=np.float32)
+
+    for i, vfp in enumerate(valid_fps):
+        if vfp is None:
+            out[i] = global_mean
+            continue
+
+        sim_vals = np.array(
+            DataStructs.BulkTanimotoSimilarity(vfp, [fp for fp in train_fps if fp is not None]),
+            dtype=np.float32,
+        )
+        valid_idx = np.array([idx for idx, fp in enumerate(train_fps) if fp is not None], dtype=np.int64)
+        if sim_vals.size == 0:
+            out[i] = global_mean
+            continue
+
+        k = int(max(1, min(top_k, sim_vals.size)))
+        top_pos = np.argpartition(sim_vals, -k)[-k:]
+        top_train_idx = valid_idx[top_pos]
+        out[i] = train_features[top_train_idx].mean(axis=0).astype(np.float32)
+    return out
+
+
+def build_train_and_valid_kg_features(
+    train_smiles: List[str],
+    valid_smiles: List[str],
+    target_name: str = "EGFR",
+    top_k: int = 5,
+) -> tuple[np.ndarray, np.ndarray]:
+    train_features = build_kg_statistical_features(train_smiles, target_name=target_name)
+    valid_features = infer_valid_features_by_knn(
+        train_smiles=train_smiles,
+        train_features=train_features,
+        valid_smiles=valid_smiles,
+        top_k=top_k,
+    )
+    return train_features, valid_features
