@@ -81,6 +81,9 @@ def run_benchmark() -> Dict:
             merged = merged.merge(mf_df[["smiles", "molformer_score"]], on="smiles", how="left")
         else:
             has_molformer = False
+    if not has_molformer:
+        print("MolFormer predictions not found -> benchmarking only MolDeBERTa and MolDeBERTa + KG.")
+        print(f"Expected file: {molformer_file}")
     if merged.empty:
         raise RuntimeError("No overlapping smiles between mol_predictions.csv and kg_predictions.csv")
 
@@ -137,6 +140,13 @@ def run_benchmark() -> Dict:
         mf_thr = _best_threshold(y_valid, method_scores["MolFormer"])
         summary["MolFormer"] = _metrics_at_threshold(y_valid, method_scores["MolFormer"], mf_thr)
 
+    kg_coef = float(meta.coef_[0][1]) if meta.coef_.ndim == 2 else float(meta.coef_[1])
+    if abs(kg_coef) < 0.05:
+        print(
+            f"WARNING: Meta-learner gives near-zero weight to KG (coef={kg_coef:.6f}). "
+            "This usually means KG scores add little information over MolDeBERTa on current split."
+        )
+
     eval_dir = Path(CONFIG["EVAL_DIR"])
     plot_dir = Path(CONFIG["PLOT_DIR"])
     eval_dir.mkdir(parents=True, exist_ok=True)
@@ -172,6 +182,14 @@ def run_benchmark() -> Dict:
         by_bin_auc=by_bin_auc,
         summary=summary,
     )
+    generated_plots = [
+        "auc_comparison_detailed.png",
+        "heatmap_detailed.png",
+        "improvement_detailed.png",
+        "active_prediction_counts.png",
+        "model_metrics_compairison.png",
+        "roc_comparison.png",
+    ]
 
     x = np.arange(len(bin_names))
     width = 0.36
@@ -195,6 +213,8 @@ def run_benchmark() -> Dict:
     print(f"Saved benchmark summary: {eval_dir / 'benchmark_summary.csv'}")
     print(f"Saved bin AUC report: {eval_dir / 'scaffold_hopping_auc_by_bin.csv'}")
     print(f"Saved chart: {plot_dir / 'scaffold_hopping_auc_comparison.png'}")
+    for name in generated_plots:
+        print(f"Saved chart: {plot_dir / name}")
     return {"summary": summary, "by_bin": rows}
 
 

@@ -6,12 +6,16 @@ import time
 from pathlib import Path
 from typing import Tuple
 
+import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
-from transformers import AutoModelForSequenceClassification, AutoTokenizer
+from transformers import AutoModel, AutoModelForSequenceClassification, AutoTokenizer
 from sklearn.metrics import f1_score
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestClassifier
 from xgboost import XGBClassifier
 
 from config import CONFIG
@@ -218,9 +222,12 @@ def run_kg_training() -> None:
     print(f"  Train feature mean: {kg_train.mean(axis=0)}")
     print(f"  Valid feature mean: {kg_valid.mean(axis=0)}")
     clf = XGBClassifier(
-        n_estimators=300,
-        max_depth=6,
-        learning_rate=0.05,
+        n_estimators=500,
+        max_depth=8,
+        learning_rate=0.03,
+        subsample=0.9,
+        colsample_bytree=0.9,
+        reg_lambda=1.0,
         tree_method="hist",
         device="cuda:0" if torch.cuda.is_available() else "cpu",
         eval_metric="logloss",
@@ -239,24 +246,184 @@ def run_kg_training() -> None:
             "kg_score": kg_probs,
         }
     ).to_csv(pred_dir / "kg_predictions.csv", index=False)
+    pd.DataFrame(
+        kg_train,
+        columns=[
+            "num_warheads",
+            "num_moas",
+            "has_egfr_path",
+            "deg_total",
+            "num_scaffolds",
+            "num_targets",
+            "num_interaction_groups",
+            "num_functional_groups",
+            "knn_mean_sim",
+            "knn_max_sim",
+            "knn_std_sim",
+        ],
+    ).assign(smiles=train_df[smiles_col].astype(str).tolist(), label=y_train).to_csv(pred_dir / "kg_features_train.csv", index=False)
+    pd.DataFrame(
+        kg_valid,
+        columns=[
+            "num_warheads",
+            "num_moas",
+            "has_egfr_path",
+            "deg_total",
+            "num_scaffolds",
+            "num_targets",
+            "num_interaction_groups",
+            "num_functional_groups",
+            "knn_mean_sim",
+            "knn_max_sim",
+            "knn_std_sim",
+        ],
+    ).assign(smiles=valid_df[smiles_col].astype(str).tolist(), label=y_valid).to_csv(pred_dir / "kg_features_valid_inferred.csv", index=False)
     print(f"Saved KG predictions: {pred_dir / 'kg_predictions.csv'}")
+
+
+def run_molformer_training() -> None:
+    _log_torch_runtime("molformer_training")
+    train_df, valid_df, smiles_col, label_col = _load_and_split()
+    y_train = labels_to_int(train_df[label_col])
+    y_valid = labels_to_int(valid_df[label_col])
+
+    model_name = CONFIG["MOLFORMER_MODEL_PATH"]
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    model = AutoModel.from_pretrained(model_name, trust_remote_code=True).eval()
+    use_cuda = torch.cuda.is_available()
+    device = "cuda" if use_cuda else "cpu"
+    model.to(device)
+
+    def _encode(smiles_list: list[str], desc: str) -> np.ndarray:
+        out = []
+        bs = CONFIG["BERT_BATCH_SIZE"]
+        for i in tqdm(range(0, len(smiles_list), bs), total=(len(smiles_list) + bs - 1) // bs, desc=desc, unit="batch"):
+            batch = smiles_list[i : i + bs]
+            toks = tokenizer(batch, padding=True, truncation=True, max_length=CONFIG["BERT_MAX_LENGTH"], return_tensors="pt")
+            toks = {k: v.to(device, non_blocking=use_cuda) for k, v in toks.items()}
+            with torch.no_grad():
+                with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_cuda):
+                    h = model(**toks).last_hidden_state
+                m = toks["attention_mask"].unsqueeze(-1).float()
+                pooled = (h * m).sum(1) / m.sum(1).clamp(min=1.0)
+                cls = h[:, 0, :]
+                rep = torch.cat([cls, pooled], dim=1)
+            out.append(rep.detach().cpu().numpy().astype(np.float32))
+        return np.vstack(out)
+
+    train_emb = _encode(train_df[smiles_col].astype(str).tolist(), "MolFormer train embeddings")
+    valid_emb = _encode(valid_df[smiles_col].astype(str).tolist(), "MolFormer valid embeddings")
+
+    # Sanitize numeric issues from encoder outputs (NaN/Inf) before sklearn fit.
+    n_bad_train = int((~np.isfinite(train_emb)).any(axis=1).sum())
+    n_bad_valid = int((~np.isfinite(valid_emb)).any(axis=1).sum())
+    if n_bad_train > 0 or n_bad_valid > 0:
+        print(f"MolFormer embedding cleanup: bad_train_rows={n_bad_train}, bad_valid_rows={n_bad_valid}")
+
+    # Replace non-finite values with per-column median (computed on finite train values).
+    train_emb = train_emb.astype(np.float32, copy=False)
+    valid_emb = valid_emb.astype(np.float32, copy=False)
+    finite_train = np.where(np.isfinite(train_emb), train_emb, np.nan)
+    col_med = np.nanmedian(finite_train, axis=0)
+    col_med = np.where(np.isfinite(col_med), col_med, 0.0).astype(np.float32)
+    train_emb = np.where(np.isfinite(train_emb), train_emb, col_med[None, :])
+    valid_emb = np.where(np.isfinite(valid_emb), valid_emb, col_med[None, :])
+
+    # Drop near-constant embedding dimensions to avoid degenerate linear model.
+    var = train_emb.var(axis=0)
+    keep = var > 1e-10
+    if not np.any(keep):
+        print("MolFormer embeddings collapsed (all near-constant). Falling back to all dims.")
+        keep = np.ones_like(var, dtype=bool)
+    train_emb = train_emb[:, keep]
+    valid_emb = valid_emb[:, keep]
+    print(f"MolFormer embedding dims kept: {train_emb.shape[1]}/{len(var)}")
+    print(f"MolFormer train embedding variance mean: {float(train_emb.var(axis=0).mean()):.6e}")
+    print(f"MolFormer train unique rows ratio: {np.unique(train_emb.round(6), axis=0).shape[0] / max(1, train_emb.shape[0]):.3f}")
+
+    scaler = StandardScaler()
+    train_x = scaler.fit_transform(train_emb)
+    valid_x = scaler.transform(valid_emb)
+
+    clf = LogisticRegression(
+        max_iter=5000,
+        random_state=CONFIG["RANDOM_STATE"],
+        class_weight="balanced",
+        solver="saga",
+    )
+    clf.fit(train_x, y_train)
+    molformer_score = clf.predict_proba(valid_x)[:, 1]
+
+    # If score collapses to near-constant, fallback to XGBoost on same embeddings.
+    if float(np.std(molformer_score)) < 1e-5:
+        print("MolFormer LR scores nearly constant, fallback to XGBoost classifier.")
+        xgb = XGBClassifier(
+            n_estimators=300,
+            max_depth=6,
+            learning_rate=0.05,
+            subsample=0.9,
+            colsample_bytree=0.9,
+            tree_method="hist",
+            device="cuda:0" if torch.cuda.is_available() else "cpu",
+            eval_metric="logloss",
+            random_state=CONFIG["RANDOM_STATE"],
+        )
+        xgb.fit(train_x, y_train)
+        molformer_score = xgb.predict_proba(valid_x)[:, 1]
+
+    # If still collapsed, fallback to RandomForest for robust non-linear decision boundary.
+    if float(np.std(molformer_score)) < 1e-5:
+        print("MolFormer XGBoost scores still nearly constant, fallback to RandomForest.")
+        rf = RandomForestClassifier(
+            n_estimators=500,
+            max_depth=None,
+            min_samples_leaf=2,
+            random_state=CONFIG["RANDOM_STATE"],
+            n_jobs=-1,
+        )
+        rf.fit(train_x, y_train)
+        molformer_score = rf.predict_proba(valid_x)[:, 1]
+
+    print(
+        "MolFormer score distribution -> "
+        f"min: {molformer_score.min():.6f}, max: {molformer_score.max():.6f}, std: {molformer_score.std():.6f}"
+    )
+
+    pred_dir = Path(CONFIG["PRED_DIR"])
+    pred_dir.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        {
+            "smiles": valid_df[smiles_col].astype(str).tolist(),
+            "label": y_valid.tolist(),
+            "molformer_score": molformer_score,
+        }
+    ).to_csv(pred_dir / "molformer_predictions.csv", index=False)
+    print(f"Saved MolFormer predictions: {pred_dir / 'molformer_predictions.csv'}")
 
 
 def run_benchmark() -> None:
     from evaluation.benchmark import run_benchmark
+
+    pred_dir = Path(CONFIG["PRED_DIR"])
+    molformer_file = pred_dir / "molformer_predictions.csv"
+    if not molformer_file.exists():
+        print("MolFormer predictions missing. Auto-running molformer_training before benchmark...")
+        run_molformer_training()
 
     run_benchmark()
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["buildkg", "finetuning", "kg_training", "benchmark"], required=True)
+    parser.add_argument("--mode", choices=["buildkg", "finetuning", "molformer_training", "kg_training", "benchmark"], required=True)
     args = parser.parse_args()
 
     if args.mode == "buildkg":
         run_buildkg()
     elif args.mode == "finetuning":
         run_finetuning()
+    elif args.mode == "molformer_training":
+        run_molformer_training()
     elif args.mode == "kg_training":
         run_kg_training()
     elif args.mode == "benchmark":
