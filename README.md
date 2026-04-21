@@ -27,11 +27,43 @@ The system follows **zero data leakage** principles, uses **Scaffold Splitting**
 
 **Evaluation Baseline:** MolFormer (`ibm/MoLFormer-XL-both-10pct`) is integrated as a SOTA reference branch.
 
-## ⚙️ 3. System Requirements & Installation
+## 📁 3. Project Layout
+
+```text
+MolDeBERTa/
+|-- config.py
+|-- main.py
+|-- utils.py
+|-- environment.yml
+|-- docker-compose.yml
+|-- README.md
+|-- model/
+|-- kg/
+|   |-- __init__.py
+|   |-- build_graph.py
+|   `-- kg_encoder.py
+|-- evaluation/
+|   |-- __init__.py
+|   |-- benchmark.py
+|   |-- data_loader.py
+|   |-- fingerprints.py
+|   |-- metrics.py
+|   |-- roc_analysis.py
+|   |-- soft_voting.py
+|   |-- method_advantage.py
+|   |-- active_analysis.py
+|   `-- visualization_script.py
+|-- data/
+|-- output/
+`-- backup/
+```
+
+## ⚙️ 4. System Requirements & Installation
 
 This project requires substantial compute for >100M parameter fine-tuning.
 
 **Hardware Recommendations**
+- CPU: Intel Core i9-12900K (16 cores, 24 threads).
 - GPU: NVIDIA RTX 3090 (24GB VRAM) or equivalent.
 - Architecture: Ampere or newer (TF32/FP16 support recommended).
 
@@ -51,7 +83,7 @@ pip install transformers accelerate datasets rdkit xgboost scikit-learn neo4j ma
 - Initialize Neo4j via Docker/Desktop.
 - Ensure connection is available at `bolt://localhost:7688` (configured in `config.py`).
 
-## 🚀 4. Pipeline Execution
+## 🚀 5. Pipeline Execution
 
 To reproduce results consistently, run modes in the exact order below.
 
@@ -84,7 +116,7 @@ python main.py --mode benchmark
 ```
 Runs the Meta-Learner, performs dynamic threshold search, and generates the full benchmark report with plots.
 
-## 📊 5. Key Results (Error Analysis)
+## 📊 6. Key Results (Error Analysis)
 
 The strength of this hybrid design is observed through Tanimoto-bin analysis:
 
