@@ -215,12 +215,39 @@ def run_kg_training() -> None:
         target_name="EGFR",
         top_k=5,
     )
+    feature_cols = [
+        "num_warheads",
+        "num_moas",
+        "has_egfr_path",
+        "deg_total",
+        "num_scaffolds",
+        "num_targets",
+        "num_interaction_groups",
+        "num_functional_groups",
+        "knn_mean_sim",
+        "knn_max_sim",
+        "knn_std_sim",
+    ]
+
     print("KG feature diagnostics:")
     print(f"  Train shape: {kg_train.shape}, Valid shape: {kg_valid.shape}")
     print(f"  Train zero rows: {(kg_train.sum(axis=1) == 0).mean():.2%}")
     print(f"  Valid zero rows: {(kg_valid.sum(axis=1) == 0).mean():.2%}")
     print(f"  Train feature mean: {kg_train.mean(axis=0)}")
     print(f"  Valid feature mean: {kg_valid.mean(axis=0)}")
+
+    # Remove useless columns (all-zero / near-constant on train split).
+    train_var = kg_train.var(axis=0)
+    keep_mask = train_var > 1e-10
+    if not np.any(keep_mask):
+        raise RuntimeError("All KG features are near-constant. Cannot train KG model.")
+    dropped_cols = [c for c, k in zip(feature_cols, keep_mask) if not k]
+    kept_cols = [c for c, k in zip(feature_cols, keep_mask) if k]
+    kg_train = kg_train[:, keep_mask]
+    kg_valid = kg_valid[:, keep_mask]
+    print(f"  Kept KG features ({len(kept_cols)}): {kept_cols}")
+    if dropped_cols:
+        print(f"  Dropped constant KG features ({len(dropped_cols)}): {dropped_cols}")
     clf = XGBClassifier(
         n_estimators=500,
         max_depth=8,
@@ -248,36 +275,17 @@ def run_kg_training() -> None:
     ).to_csv(pred_dir / "kg_predictions.csv", index=False)
     pd.DataFrame(
         kg_train,
-        columns=[
-            "num_warheads",
-            "num_moas",
-            "has_egfr_path",
-            "deg_total",
-            "num_scaffolds",
-            "num_targets",
-            "num_interaction_groups",
-            "num_functional_groups",
-            "knn_mean_sim",
-            "knn_max_sim",
-            "knn_std_sim",
-        ],
+        columns=kept_cols,
     ).assign(smiles=train_df[smiles_col].astype(str).tolist(), label=y_train).to_csv(pred_dir / "kg_features_train.csv", index=False)
     pd.DataFrame(
         kg_valid,
-        columns=[
-            "num_warheads",
-            "num_moas",
-            "has_egfr_path",
-            "deg_total",
-            "num_scaffolds",
-            "num_targets",
-            "num_interaction_groups",
-            "num_functional_groups",
-            "knn_mean_sim",
-            "knn_max_sim",
-            "knn_std_sim",
-        ],
+        columns=kept_cols,
     ).assign(smiles=valid_df[smiles_col].astype(str).tolist(), label=y_valid).to_csv(pred_dir / "kg_features_valid_inferred.csv", index=False)
+    pd.DataFrame(
+        {
+            "kept_feature": kept_cols,
+        }
+    ).to_csv(pred_dir / "kg_selected_features.csv", index=False)
     print(f"Saved KG predictions: {pred_dir / 'kg_predictions.csv'}")
 
 
