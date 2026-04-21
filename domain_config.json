@@ -1,0 +1,74 @@
+{
+  "Target_Info": {
+    "name": "EGFR",
+    "full_name": "Epidermal Growth Factor Receptor",
+    "generic_label": "EGFR_Generic",
+    "similarity_threshold": 0.35
+  },
+
+  "Reference_Drugs": {
+    "Gefitinib": {
+      "smiles": "COc1cc2ncnc(Nc3ccc(F)c(Cl)c3)c2cc1OCCCN1CCOCC1",
+      "target": "EGFR_WT"
+    },
+    "Erlotinib": {
+      "smiles": "COCCOc1cc2ncnc(Nc3cccc(C#C)c3)c2cc1OCCOC",
+      "target": "EGFR_WT"
+    },
+    "Osimertinib": {
+      "smiles": "C=CC(=O)Nc1cc(Nc2ncnc3cc(N(C)CCN(C)C)c(OC)cc23)c(OC)cc1",
+      "target": "EGFR_T790M"
+    },
+    "Rociletinib": {
+      "smiles": "CN(C)CCN(C)c1cc(Nc2ncc(C(F)(F)F)c(Nc3cc(C(=O)N)ccc3)n2)cc(N)n1",
+      "target": "EGFR_T790M"
+    },
+    "Afatinib": {
+      "smiles": "CN(C)C/C=C/C(=O)Nc1cc2c(Nc3ccc(F)c(Cl)c3)ncnc2cc1O[C@H]3CCOC3",
+      "target": "EGFR_WT"
+    }
+  },
+
+  "Interaction_Groups": [
+    {
+      "name": "Acrylamide",
+      "smarts": "C=CC(=O)N",
+      "moa": "Covalent_Inhibitor"
+    },
+    {
+      "name": "Propynamide",
+      "smarts": "C#CC(=O)N",
+      "moa": "Covalent_Inhibitor"
+    },
+    {
+      "name": "Chloroacetamide",
+      "smarts": "ClCC(=O)N",
+      "moa": "Covalent_Inhibitor"
+    },
+    {
+      "name": "Vinyl_sulfonamide",
+      "smarts": "C=CS(=O)(=O)N",
+      "moa": "Covalent_Inhibitor"
+    },
+    {
+      "name": "Epoxide",
+      "smarts": "C1OC1",
+      "moa": "Covalent_Inhibitor"
+    },
+    {
+      "name": "Michael_Acceptor",
+      "smarts": "C=CC(=O)",
+      "moa": "Covalent_Inhibitor"
+    }
+  ],
+
+  "Target_Specific_Rules": {
+    "Quinazoline_Core": "c1cc2ncnc(Nc3ccccc3)c2cc1",
+    "Pyrimidine_Core": "c1cncnc1",
+    "Aniline_Group": "Nc1ccccc1",
+    "Fluorine": "[F]",
+    "Chlorine": "[Cl]",
+    "Bromine": "[Br]",
+    "Ether_Link": "COC"
+  }
+}
