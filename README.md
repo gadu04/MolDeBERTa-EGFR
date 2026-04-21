@@ -35,6 +35,7 @@ MolDeBERTa/
 |-- main.py
 |-- utils.py
 |-- environment.yml
+|-- requirements.txt
 |-- docker-compose.yml
 |-- README.md
 |-- model/
@@ -63,20 +64,17 @@ MolDeBERTa/
 This project requires substantial compute for >100M parameter fine-tuning.
 
 **Hardware Recommendations**
-- CPU: Intel Core i9-12900K (16 cores, 24 threads).
-- GPU: NVIDIA RTX 3090 (24GB VRAM) or equivalent.
+- CPU: 12th Gen Intel(R) Core(TM) i9-12900K (16 cores, 24 threads).
+- GPU: NVIDIA GeForce RTX 3090 (24GB VRAM) or equivalent.
 - Architecture: Ampere or newer (TF32/FP16 support recommended).
 
 **Environment Setup (Conda + Pip)**
 ```bash
-conda create -n Mol python=3.10 -y
+conda env create -f environment.yml
 conda activate Mol
 
-# PyTorch CUDA 12.1 (recommended for RTX 30-series)
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-
-# Core dependencies
-pip install transformers accelerate datasets rdkit xgboost scikit-learn neo4j matplotlib seaborn tqdm pandas numpy
+# Install all Python dependencies from requirements.txt
+pip install -r requirements.txt
 ```
 
 **Graph Database**

@@ -1,29 +1,6 @@
-name: moldeberta
+name: Mol
 channels:
-  - pytorch
-  - nvidia
-  - conda-forge
   - defaults
 dependencies:
   - python=3.10
   - pip
-  - rdkit>=2025.03
-  - pip:
-      - torch==2.7.1 --extra-index-url https://download.pytorch.org/whl/cu118
-      - torchvision==0.22.1 --extra-index-url https://download.pytorch.org/whl/cu118
-      - torchaudio==2.7.1 --extra-index-url https://download.pytorch.org/whl/cu118
-      - accelerate==1.10.1
-      - transformers==4.56.2
-      - tokenizers
-      - datasets
-      - deepchem==2.8.0
-      - captum==0.8.0
-      - torch-geometric
-      - optuna==4.5.0
-      - numpy
-      - pandas
-      - scikit-learn
-      - matplotlib
-      - joblib
-      - tqdm
-      - click

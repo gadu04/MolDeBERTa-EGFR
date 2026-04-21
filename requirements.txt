@@ -1,0 +1,24 @@
+--extra-index-url https://download.pytorch.org/whl/cu121
+
+torch
+torchvision
+torchaudio
+accelerate
+transformers
+tokenizers
+datasets
+rdkit
+deepchem
+captum
+torch-geometric
+optuna
+numpy
+pandas
+scikit-learn
+xgboost
+neo4j
+matplotlib
+seaborn
+tqdm
+joblib
+click
