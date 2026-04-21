@@ -81,3 +81,7 @@ model/
 data/**/*.csv
 data/*.csv
 !data/.gitkeep
+
+
+#Neo4J 
+neo4j_data/

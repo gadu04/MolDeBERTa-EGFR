@@ -1,0 +1,1 @@
+"""Soft voting compatibility module."""

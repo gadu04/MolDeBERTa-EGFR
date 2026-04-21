@@ -1,0 +1,1 @@
+"""Method advantage compatibility module."""
