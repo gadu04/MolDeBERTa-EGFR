@@ -71,8 +71,13 @@ runs/
 wandb/
 mlruns/
 
-# Project output directory (plots/embeddings and other generated results)
-output/
+#Model Finetuning
+output/finetuned_model/
+
+#Data scaffold splits
+output/splits/
+
+
 
 # Large model artifacts
 model/
