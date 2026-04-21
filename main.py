@@ -289,7 +289,16 @@ def run_molformer_training() -> None:
 
     model_name = CONFIG["MOLFORMER_MODEL_PATH"]
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    model = AutoModel.from_pretrained(model_name, trust_remote_code=True).eval()
+    try:
+        model = AutoModel.from_pretrained(
+            model_name,
+            deterministic_eval=True,
+            trust_remote_code=True,
+        )
+    except TypeError:
+        # Some transformer versions/models do not accept deterministic_eval.
+        model = AutoModel.from_pretrained(model_name, trust_remote_code=True)
+    model = model.float().eval()
     use_cuda = torch.cuda.is_available()
     device = "cuda" if use_cuda else "cpu"
     model.to(device)
@@ -297,18 +306,30 @@ def run_molformer_training() -> None:
     def _encode(smiles_list: list[str], desc: str) -> np.ndarray:
         out = []
         bs = CONFIG["BERT_BATCH_SIZE"]
-        for i in tqdm(range(0, len(smiles_list), bs), total=(len(smiles_list) + bs - 1) // bs, desc=desc, unit="batch"):
-            batch = smiles_list[i : i + bs]
-            toks = tokenizer(batch, padding=True, truncation=True, max_length=CONFIG["BERT_MAX_LENGTH"], return_tensors="pt")
-            toks = {k: v.to(device, non_blocking=use_cuda) for k, v in toks.items()}
-            with torch.no_grad():
-                with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_cuda):
-                    h = model(**toks).last_hidden_state
-                m = toks["attention_mask"].unsqueeze(-1).float()
-                pooled = (h * m).sum(1) / m.sum(1).clamp(min=1.0)
+        with torch.no_grad():
+            for i in tqdm(range(0, len(smiles_list), bs), total=(len(smiles_list) + bs - 1) // bs, desc=desc, unit="batch"):
+                batch = smiles_list[i : i + bs]
+                toks = tokenizer(
+                    batch,
+                    padding=True,
+                    truncation=True,
+                    max_length=CONFIG["BERT_MAX_LENGTH"],
+                    return_tensors="pt",
+                )
+                input_ids = toks["input_ids"].to(device, non_blocking=use_cuda)
+                attention_mask = toks["attention_mask"].to(device, non_blocking=use_cuda)
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                h = outputs.last_hidden_state.float()
+
+                # Stable pooled representations: CLS + masked mean pooling.
                 cls = h[:, 0, :]
-                rep = torch.cat([cls, pooled], dim=1)
-            out.append(rep.detach().cpu().numpy().astype(np.float32))
+                mask = attention_mask.unsqueeze(-1).float()
+                pooled = (h * mask).sum(1) / mask.sum(1).clamp(min=1.0)
+                rep = torch.cat([cls, pooled], dim=1).detach().cpu().numpy().astype(np.float32)
+
+                if np.isnan(rep).any() or np.isinf(rep).any():
+                    np.nan_to_num(rep, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+                out.append(rep)
         return np.vstack(out)
 
     train_emb = _encode(train_df[smiles_col].astype(str).tolist(), "MolFormer train embeddings")
