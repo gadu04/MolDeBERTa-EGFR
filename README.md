@@ -1,241 +1,111 @@
-# MolDeBERTa-EGFR Benchmark Suite
+# 🧬 EGFR Inhibitory Activity Prediction: Solving the Scaffold Hopping Problem with MolDeBERTa and Knowledge Graphs
 
-EGFR activity prediction pipeline using:
+![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
+![PyTorch](https://img.shields.io/badge/PyTorch-2.5.1%2Bcu121-EE4C2C)
+![Neo4j](https://img.shields.io/badge/Neo4j-Graph_Database-008CC1)
+![License](https://img.shields.io/badge/License-MIT-green)
 
-- MolDeBERTa fine-tuning
-- KG statistical features (Neo4j)
-- MolFormer baseline
-- Scaffold-hopping benchmark by Tanimoto similarity bins
+## 📌 1. Abstract
 
-![Python](https://img.shields.io/badge/Python-3.10-3776AB?logo=python&logoColor=white)
-![PyTorch](https://img.shields.io/badge/PyTorch-2.x-EE4C2C?logo=pytorch&logoColor=white)
-![RDKit](https://img.shields.io/badge/RDKit-enabled-2E7D32)
-![Neo4j](https://img.shields.io/badge/Neo4j-KG-008CC1?logo=neo4j&logoColor=white)
-![Mode](https://img.shields.io/badge/Mode-BuildKG%20%7C%20FineTune%20%7C%20KGTrain%20%7C%20Benchmark-0A66C2)
+Chemical language models (Foundation Models) such as **MolDeBERTa** have achieved State-of-the-Art (SOTA) performance in molecular property prediction. However, they face a severe limitation when tackling the **Scaffold Hopping** problem, i.e., the ability to accurately predict the activity of compounds with entirely novel structural backbones (Low/Very Low structural similarity compared to the training set).
 
----
+This project proposes a hybrid architecture to overcome this limitation by integrating a **Biomedical Knowledge Graph (KG)**. By employing a Meta-Learner to combine prediction probabilities from MolDeBERTa with statistical graph features (inferred via K-NN Tanimoto similarity for unseen data), the system targets improved ROC-AUC specifically within low-similarity chemical spaces.
 
-## Highlights
+## 🏗️ 2. System Architecture
 
-- Scaffold split evaluation focused on low-similarity generalization.
-- Independent branches:
-  - `MolDeBERTa` (fine-tuned classifier)
-  - `KG` (count-based graph features + KNN feature inference)
-  - `MolFormer` (embedding baseline)
-- Ensemble by meta-learner (Logistic Regression): `(mol_score, kg_score) -> final_score`.
-- Dynamic threshold search (0.1-0.9) for best F1-macro reporting.
-- Full reporting to CSV/JSON + publication-style plots.
+The system follows **zero data leakage** principles, uses **Scaffold Splitting**, and runs through three independent branches:
 
----
+1. **The NLP Branch (MolDeBERTa):**
+   End-to-end fine-tuning of `MolDeBERTa-base-123M-mtr` to extract sequence-based chemical signals directly from SMILES strings.
 
-## Project Layout
+2. **The Graph Branch (Knowledge Graph):**
+   - Queries biomedical statistical features (e.g., warhead count, mechanism-of-action count) from Neo4j.
+   - Solves the validation "orphan node" problem via **K-NN Graph Projection (Neighborhood Aggregation)**, inferring graph features by Top-K Tanimoto similarity from the training set.
 
-```text
-MolDeBERTa/
-|-- main.py
-|-- config.py
-|-- utils.py
-|-- README.md
-|-- build_graph.py               # compatibility wrapper
-|-- kg_encoder.py                # compatibility wrapper
-|-- kg/
-|   |-- build_graph.py
-|   `-- kg_encoder.py
-|-- evaluation/
-|   `-- benchmark.py
-|-- model/                       # local MolDeBERTa model files
-|-- data/
-|   |-- data_end.csv
-|   `-- DeNovo_Molecule.csv
-`-- output/
-    |-- splits/
-    |-- predictions/
-    |-- benchmark/
-    `-- plots/
-```
+3. **The Ensemble Branch (Meta-Learner):**
+   Uses Logistic Regression stacking to learn optimal soft-voting weights from MolDeBERTa and KG probabilities, then applies **Dynamic Thresholding** to maximize F1-Macro on imbalanced biomedical labels.
 
----
+**Evaluation Baseline:** MolFormer (`ibm/MoLFormer-XL-both-10pct`) is integrated as a SOTA reference branch.
 
-## Installation
+## ⚙️ 3. System Requirements & Installation
 
+This project requires substantial compute for >100M parameter fine-tuning.
+
+**Hardware Recommendations**
+- GPU: NVIDIA RTX 3090 (24GB VRAM) or equivalent.
+- Architecture: Ampere or newer (TF32/FP16 support recommended).
+
+**Environment Setup (Conda + Pip)**
 ```bash
-conda env create --file environment.yml
+conda create -n Mol python=3.10 -y
 conda activate Mol
+
+# PyTorch CUDA 12.1 (recommended for RTX 30-series)
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+# Core dependencies
+pip install transformers accelerate datasets rdkit xgboost scikit-learn neo4j matplotlib seaborn tqdm pandas numpy
 ```
 
-If Neo4j features are used:
+**Graph Database**
+- Initialize Neo4j via Docker/Desktop.
+- Ensure connection is available at `bolt://localhost:7688` (configured in `config.py`).
 
-```bash
-docker compose up -d neo4j
-```
+## 🚀 4. Pipeline Execution
 
----
+To reproduce results consistently, run modes in the exact order below.
 
-## Run Modes
-
-Entrypoint:
-
+### Step 1: Initialize the Knowledge Graph
 ```bash
 python main.py --mode buildkg
-python main.py --mode finetuning
+```
+Executes scaffold splitting, resets old graph state, creates required structures, and imports Train/DeNovo molecules into Neo4j.
+
+### Step 2: Train the SOTA Baseline (MolFormer)
+```bash
 python main.py --mode molformer_training
-python main.py --mode kg_training
-python main.py --mode benchmark
+```
+Runs in strict FP32 precision (stability on Ampere), saves predictions to `output/predictions/`.
+
+### Step 3: Fine-Tune the Core NLP Model (MolDeBERTa)
+```bash
+python main.py --mode finetuning
 ```
 
-### 1) `buildkg`
+### Step 4: Train the Graph Branch (KG)
+```bash
+python main.py --mode kg_training
+```
+Extracts Cypher statistical features, performs K-NN Tanimoto inference for validation molecules, and trains an independent XGBoost classifier.
 
-- Reads `data/data_end.csv`
-- Performs scaffold split (same split policy as other modes)
-- Imports **train split only** into Neo4j
-- Optionally imports de novo molecules from `data/DeNovo_Molecule.csv`
+### Step 5: Ensemble and Evaluation (Benchmark)
+```bash
+python main.py --mode benchmark
+```
+Runs the Meta-Learner, performs dynamic threshold search, and generates the full benchmark report with plots.
 
-### 2) `finetuning`
+## 📊 5. Key Results (Error Analysis)
 
-- Fine-tunes MolDeBERTa from local `model/`
-- Binary head (`num_labels=2`)
-- Saves:
-  - `output/finetuned_model/`
-  - `output/predictions/mol_predictions.csv`
+The strength of this hybrid design is observed through Tanimoto-bin analysis:
 
-### 3) `molformer_training`
+- In the **High Similarity** region (`>0.8`), standalone MolDeBERTa already performs strongly.
+- In **Very Low / Low Similarity** regions (`<0.6`), MolDeBERTa performance declines due to structural novelty (Scaffold Hopping barrier).
+- In these difficult regions, KG-derived domain knowledge acts as a complementary signal, and the combined pipeline (`MolDeBERTa + KG`) is expected to improve robustness over a single NLP branch.
 
-- Builds MolFormer FP32 embeddings
-- Trains classifier on train split
-- Saves:
-  - `output/predictions/molformer_predictions.csv`
+**Generated figures are saved in `output/plots/`:**
+- `auc_comparison_detailed.png`
+- `active_prediction_counts.png`
+- `heatmap_detailed.png`
+- `improvement_detailed.png`
+- `model_metrics_compairison.png`
+- `roc_comparison.png`
 
-### 4) `kg_training`
+---
 
-- Extracts train KG statistical features from Neo4j
-- Infers valid features by Top-K weighted Tanimoto neighbors
-- Trains XGBoost on KG features
-- Saves:
-  - `output/predictions/kg_predictions.csv`
+### Practical Notes
+
+- Current KG feature files are generated from:
   - `output/predictions/kg_features_train.csv`
   - `output/predictions/kg_features_valid_inferred.csv`
-  - `output/predictions/kg_selected_features.csv`
-
-### 5) `benchmark`
-
-- Loads predictions from MolDeBERTa + KG (+ MolFormer if available)
-- If `molformer_predictions.csv` is missing, auto-runs `molformer_training`
-- Fits meta-learner for pipeline score
-- Evaluates per similarity bin (Very Low / Low / Medium / High)
-- Saves reports and plots
-
----
-
-## KG Feature Set (Current)
-
-Graph/statistical features include:
-
-- `num_warheads`
-- `num_moas`
-- `has_egfr_path`
-- `deg_total`
-- `num_scaffolds`
-- `num_targets`
-- `num_interaction_groups`
-- `num_functional_groups`
-- `knn_mean_sim`
-- `knn_max_sim`
-- `knn_std_sim`
-
-Pipeline automatically drops constant/near-constant columns before KG model training.
-
----
-
-## Outputs
-
-### Splits
-
-- `output/splits/train_split.csv`
-- `output/splits/valid_split.csv`
-
-### Predictions
-
-- `output/predictions/mol_predictions.csv`
-- `output/predictions/kg_predictions.csv`
-- `output/predictions/molformer_predictions.csv` (when available)
-
-### Benchmark tables
-
-- `output/benchmark/benchmark_summary.csv`
-- `output/benchmark/scaffold_hopping_auc_by_bin.csv`
-- `output/benchmark/meta_learner_weights.json`
-- `output/benchmark/benchmark_results.json`
-
-### Plots
-
-- `output/plots/scaffold_hopping_auc_comparison.png`
-- `output/plots/auc_comparison_detailed.png`
-- `output/plots/heatmap_detailed.png`
-- `output/plots/roc_comparison.png`
-- `output/plots/model_metrics_compairison.png`
-- `output/plots/active_prediction_counts.png`
-- `output/plots/improvement_detailed.png`
-
----
-
-## Configuration
-
-Main settings live in `config.py`:
-
-- Data/model paths:
-  - `DATA_CSV`
-  - `MODEL_PATH`
-  - `MOLFORMER_MODEL_PATH`
-- Output paths:
-  - `OUTPUT_DIR`
-  - `PRED_DIR`
-  - `EVAL_DIR`
-  - `PLOT_DIR`
-  - `SPLIT_DIR`
-- Train/eval:
-  - `TEST_SIZE`
-  - `RANDOM_STATE`
-  - `BERT_BATCH_SIZE`
-  - `BERT_MAX_LENGTH`
-  - `FINETUNE_EPOCHS`, `FINETUNE_LR`
-- KG/Neo4j:
-  - `NEO4J_URI`
-  - `NEO4J_USER`
-  - `NEO4J_PASSWORD`
-
----
-
-## Typical Workflow
-
-```bash
-python main.py --mode buildkg
-python main.py --mode finetuning
-python main.py --mode molformer_training
-python main.py --mode kg_training
-python main.py --mode benchmark
-```
-
----
-
-## Troubleshooting
-
-1. **Benchmark missing MolFormer column**
-- Ensure `output/predictions/molformer_predictions.csv` exists.
-- Or run benchmark once; it auto-triggers `molformer_training` if missing.
-
-2. **KG contributes very little**
-- Check `output/predictions/kg_selected_features.csv`.
-- Check KG feature sparsity in `kg_features_train.csv`.
-- Rebuild KG with `--mode buildkg` after data/config changes.
-
-3. **GPU not used**
-- Verify CUDA-enabled PyTorch:
-  - `python -c "import torch; print(torch.__version__, torch.cuda.is_available())"`
-- If `+cpu` build is installed, reinstall CUDA build.
-
----
-
-## Notes
-
-This repository is for computational screening and model benchmarking.
-Results should be interpreted with medicinal chemistry and biological context.
+- Constant/near-constant KG columns are automatically removed before KG model training.
+- Benchmark automatically loads MolFormer predictions if available (or triggers generation when configured).
