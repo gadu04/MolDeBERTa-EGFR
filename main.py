@@ -24,7 +24,7 @@ from xgboost import XGBClassifier
 from rdkit import Chem
 
 from config import CONFIG
-from utils import detect_smiles_column, labels_to_int, stratified_scaffold_split
+from utils import detect_smiles_column, labels_to_int, stratified_scaffold_split_3way
 
 
 def _log_torch_runtime(task_name: str) -> None:
@@ -44,14 +44,15 @@ def _log_torch_runtime(task_name: str) -> None:
         print("  Hint: install CUDA-enabled PyTorch in this env (not +cpu build).")
 
 
-def _load_and_split() -> Tuple[pd.DataFrame, pd.DataFrame, str, str]:
+def _load_and_split() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, str, str]:
     df = pd.read_csv(CONFIG["DATA_CSV"])
     smiles_col = detect_smiles_column(df)
     label_col = CONFIG["LABEL_COLUMN"]
-    train_df, valid_df = stratified_scaffold_split(
+    train_df, valid_df, test_df = stratified_scaffold_split_3way(
         df=df,
         smiles_col=smiles_col,
         label_col=label_col,
+        valid_size=CONFIG["VALID_SIZE"],
         test_size=CONFIG["TEST_SIZE"],
         seed=CONFIG["RANDOM_STATE"],
     )
@@ -59,7 +60,8 @@ def _load_and_split() -> Tuple[pd.DataFrame, pd.DataFrame, str, str]:
     split_dir.mkdir(parents=True, exist_ok=True)
     train_df.to_csv(split_dir / "train_split.csv", index=False)
     valid_df.to_csv(split_dir / "valid_split.csv", index=False)
-    return train_df, valid_df, smiles_col, label_col
+    test_df.to_csv(split_dir / "test_split.csv", index=False)
+    return train_df, valid_df, test_df, smiles_col, label_col
 
 
 class SmilesDataset(Dataset):
@@ -156,9 +158,10 @@ class FocalLossTrainer(Trainer):
 
 def run_finetuning() -> None:
     _log_torch_runtime("finetuning")
-    train_df, valid_df, smiles_col, label_col = _load_and_split()
+    train_df, valid_df, test_df, smiles_col, label_col = _load_and_split()
     y_train = labels_to_int(train_df[label_col])
     y_valid = labels_to_int(valid_df[label_col])
+    y_test = labels_to_int(test_df[label_col])
 
     tokenizer = AutoTokenizer.from_pretrained(CONFIG["MODEL_PATH"])
     model = AutoModelForSequenceClassification.from_pretrained(CONFIG["MODEL_PATH"], num_labels=2)
@@ -200,6 +203,7 @@ def run_finetuning() -> None:
     # HuggingFace datasets + tokenizer
     train_hf = HFDataset.from_pandas(pd.DataFrame({"smiles": train_df_aug[smiles_col].astype(str), "labels": y_train_aug}))
     valid_hf = HFDataset.from_pandas(pd.DataFrame({"smiles": valid_df[smiles_col].astype(str), "labels": y_valid}))
+    test_hf = HFDataset.from_pandas(pd.DataFrame({"smiles": test_df[smiles_col].astype(str), "labels": y_test}))
 
     def _tok(batch):
         return tokenizer(
@@ -211,8 +215,10 @@ def run_finetuning() -> None:
 
     train_hf = train_hf.map(_tok, batched=True, remove_columns=["smiles"])
     valid_hf = valid_hf.map(_tok, batched=True, remove_columns=["smiles"])
+    test_hf = test_hf.map(_tok, batched=True, remove_columns=["smiles"])
     train_hf.set_format(type="torch")
     valid_hf.set_format(type="torch")
+    test_hf.set_format(type="torch")
 
     def _compute_metrics(eval_pred):
         logits, labels = eval_pred
@@ -281,10 +287,13 @@ def run_finetuning() -> None:
     trainer.model.save_pretrained(finetuned_dir)
     tokenizer.save_pretrained(finetuned_dir)
 
-    # Predict probabilities on VALID only (no augmentation, no leakage).
-    pred_out = trainer.predict(valid_hf)
-    valid_logits = pred_out.predictions
-    probs = torch.softmax(torch.tensor(valid_logits), dim=1)[:, 1].cpu().numpy().tolist()
+    # Predict probabilities on VALID and TEST (test is untouched for model selection/tuning).
+    pred_valid = trainer.predict(valid_hf)
+    valid_logits = pred_valid.predictions
+    valid_probs = torch.softmax(torch.tensor(valid_logits), dim=1)[:, 1].cpu().numpy().tolist()
+    pred_test = trainer.predict(test_hf)
+    test_logits = pred_test.predictions
+    test_probs = torch.softmax(torch.tensor(test_logits), dim=1)[:, 1].cpu().numpy().tolist()
 
     pred_dir = Path(CONFIG["PRED_DIR"])
     pred_dir.mkdir(parents=True, exist_ok=True)
@@ -292,18 +301,26 @@ def run_finetuning() -> None:
         {
             "smiles": valid_df[smiles_col].astype(str).tolist(),
             "label": y_valid.tolist(),
-            "mol_score": probs,
+            "mol_score": valid_probs,
         }
-    ).to_csv(pred_dir / "mol_predictions.csv", index=False)
+    ).to_csv(pred_dir / "mol_predictions_valid.csv", index=False)
+    pd.DataFrame(
+        {
+            "smiles": test_df[smiles_col].astype(str).tolist(),
+            "label": y_test.tolist(),
+            "mol_score": test_probs,
+        }
+    ).to_csv(pred_dir / "mol_predictions_test.csv", index=False)
     print(f"Saved finetuned model: {finetuned_dir}")
-    print(f"Saved MolDeBERTa predictions: {pred_dir / 'mol_predictions.csv'}")
+    print(f"Saved MolDeBERTa VALID predictions: {pred_dir / 'mol_predictions_valid.csv'}")
+    print(f"Saved MolDeBERTa TEST predictions: {pred_dir / 'mol_predictions_test.csv'}")
 
 
 def run_buildkg() -> None:
     _ensure_neo4j_ready()
     from kg.build_graph import KnowledgeGraphBuilder
 
-    train_df, _, smiles_col, label_col = _load_and_split()
+    train_df, _, _, smiles_col, label_col = _load_and_split()
     with KnowledgeGraphBuilder(config_path=CONFIG["DOMAIN_CONFIG_PATH"]) as builder:
         builder.nuke_and_prepare_db()
         builder.process_experimental_molecules(train_df, smiles_col=smiles_col, label_col=label_col)
@@ -317,20 +334,22 @@ def run_buildkg() -> None:
 
 def run_kg_training() -> None:
     _ensure_neo4j_ready()
-    from kg.kg_encoder import build_train_and_valid_kg_features
+    from kg.kg_encoder import build_train_valid_test_kg_features
 
-    train_df, valid_df, smiles_col, label_col = _load_and_split()
+    train_df, valid_df, test_df, smiles_col, label_col = _load_and_split()
     y_train = labels_to_int(train_df[label_col])
     y_valid = labels_to_int(valid_df[label_col])
+    y_test = labels_to_int(test_df[label_col])
     n_pos = int((y_train == 1).sum())
     n_neg = int((y_train == 0).sum())
     pos_weight = float(n_neg) / float(max(n_pos, 1))
     print(f"XGBoost dynamic scale_pos_weight (from train split): neg={n_neg}, pos={n_pos}, scale_pos_weight={pos_weight:.6f}")
 
-    print("Extracting train KG features + inferring valid features via Top-K Tanimoto neighbors...")
-    kg_train, kg_valid = build_train_and_valid_kg_features(
+    print("Extracting train KG features + inferring valid/test features via Top-K Tanimoto neighbors...")
+    kg_train, kg_valid, kg_test = build_train_valid_test_kg_features(
         train_smiles=train_df[smiles_col].astype(str).tolist(),
         valid_smiles=valid_df[smiles_col].astype(str).tolist(),
+        test_smiles=test_df[smiles_col].astype(str).tolist(),
         train_y=y_train,
         target_name="EGFR",
         top_k=5,
@@ -354,7 +373,7 @@ def run_kg_training() -> None:
     ]
 
     print("KG feature diagnostics:")
-    print(f"  Train shape: {kg_train.shape}, Valid shape: {kg_valid.shape}")
+    print(f"  Train shape: {kg_train.shape}, Valid shape: {kg_valid.shape}, Test shape: {kg_test.shape}")
     print(f"  Train zero rows: {(kg_train.sum(axis=1) == 0).mean():.2%}")
     print(f"  Valid zero rows: {(kg_valid.sum(axis=1) == 0).mean():.2%}")
     print(f"  Train feature mean: {kg_train.mean(axis=0)}")
@@ -369,6 +388,7 @@ def run_kg_training() -> None:
     kept_cols = [c for c, k in zip(feature_cols, keep_mask) if k]
     kg_train = kg_train[:, keep_mask]
     kg_valid = kg_valid[:, keep_mask]
+    kg_test = kg_test[:, keep_mask]
     print(f"  Kept KG features ({len(kept_cols)}): {kept_cols}")
     if dropped_cols:
         print(f"  Dropped constant KG features ({len(dropped_cols)}): {dropped_cols}")
@@ -436,8 +456,16 @@ def run_kg_training() -> None:
             name = kept_cols[j] if j < len(kept_cols) else f"f{j}"
             print(f"  {name}: {float(imp[j]):.6f}")
 
-    kg_probs = clf.predict_proba(kg_valid)[:, 1]
-    print(f"KG score distribution -> min: {kg_probs.min():.6f}, max: {kg_probs.max():.6f}, std: {kg_probs.std():.6f}")
+    kg_probs_valid = clf.predict_proba(kg_valid)[:, 1]
+    kg_probs_test = clf.predict_proba(kg_test)[:, 1]
+    print(
+        "KG score distribution (valid) -> "
+        f"min: {kg_probs_valid.min():.6f}, max: {kg_probs_valid.max():.6f}, std: {kg_probs_valid.std():.6f}"
+    )
+    print(
+        "KG score distribution (test) -> "
+        f"min: {kg_probs_test.min():.6f}, max: {kg_probs_test.max():.6f}, std: {kg_probs_test.std():.6f}"
+    )
 
     pred_dir = Path(CONFIG["PRED_DIR"])
     pred_dir.mkdir(parents=True, exist_ok=True)
@@ -445,9 +473,16 @@ def run_kg_training() -> None:
         {
             "smiles": valid_df[smiles_col].astype(str).tolist(),
             "label": y_valid.tolist(),
-            "kg_score": kg_probs,
+            "kg_score": kg_probs_valid,
         }
-    ).to_csv(pred_dir / "kg_predictions.csv", index=False)
+    ).to_csv(pred_dir / "kg_predictions_valid.csv", index=False)
+    pd.DataFrame(
+        {
+            "smiles": test_df[smiles_col].astype(str).tolist(),
+            "label": y_test.tolist(),
+            "kg_score": kg_probs_test,
+        }
+    ).to_csv(pred_dir / "kg_predictions_test.csv", index=False)
     pd.DataFrame(
         kg_train,
         columns=kept_cols,
@@ -457,18 +492,24 @@ def run_kg_training() -> None:
         columns=kept_cols,
     ).assign(smiles=valid_df[smiles_col].astype(str).tolist(), label=y_valid).to_csv(pred_dir / "kg_features_valid_inferred.csv", index=False)
     pd.DataFrame(
+        kg_test,
+        columns=kept_cols,
+    ).assign(smiles=test_df[smiles_col].astype(str).tolist(), label=y_test).to_csv(pred_dir / "kg_features_test_inferred.csv", index=False)
+    pd.DataFrame(
         {
             "kept_feature": kept_cols,
         }
     ).to_csv(pred_dir / "kg_selected_features.csv", index=False)
-    print(f"Saved KG predictions: {pred_dir / 'kg_predictions.csv'}")
+    print(f"Saved KG VALID predictions: {pred_dir / 'kg_predictions_valid.csv'}")
+    print(f"Saved KG TEST predictions: {pred_dir / 'kg_predictions_test.csv'}")
 
 
 def run_molformer_training() -> None:
     _log_torch_runtime("molformer_training")
-    train_df, valid_df, smiles_col, label_col = _load_and_split()
+    train_df, valid_df, test_df, smiles_col, label_col = _load_and_split()
     y_train = labels_to_int(train_df[label_col])
     y_valid = labels_to_int(valid_df[label_col])
+    y_test = labels_to_int(test_df[label_col])
 
     model_name = CONFIG["MOLFORMER_MODEL_PATH"]
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
@@ -517,6 +558,7 @@ def run_molformer_training() -> None:
 
     train_emb = _encode(train_df[smiles_col].astype(str).tolist(), "MolFormer train embeddings")
     valid_emb = _encode(valid_df[smiles_col].astype(str).tolist(), "MolFormer valid embeddings")
+    test_emb = _encode(test_df[smiles_col].astype(str).tolist(), "MolFormer test embeddings")
 
     # Sanitize numeric issues from encoder outputs (NaN/Inf) before sklearn fit.
     n_bad_train = int((~np.isfinite(train_emb)).any(axis=1).sum())
@@ -527,11 +569,13 @@ def run_molformer_training() -> None:
     # Replace non-finite values with per-column median (computed on finite train values).
     train_emb = train_emb.astype(np.float32, copy=False)
     valid_emb = valid_emb.astype(np.float32, copy=False)
+    test_emb = test_emb.astype(np.float32, copy=False)
     finite_train = np.where(np.isfinite(train_emb), train_emb, np.nan)
     col_med = np.nanmedian(finite_train, axis=0)
     col_med = np.where(np.isfinite(col_med), col_med, 0.0).astype(np.float32)
     train_emb = np.where(np.isfinite(train_emb), train_emb, col_med[None, :])
     valid_emb = np.where(np.isfinite(valid_emb), valid_emb, col_med[None, :])
+    test_emb = np.where(np.isfinite(test_emb), test_emb, col_med[None, :])
 
     # Drop near-constant embedding dimensions to avoid degenerate linear model.
     var = train_emb.var(axis=0)
@@ -541,6 +585,7 @@ def run_molformer_training() -> None:
         keep = np.ones_like(var, dtype=bool)
     train_emb = train_emb[:, keep]
     valid_emb = valid_emb[:, keep]
+    test_emb = test_emb[:, keep]
     print(f"MolFormer embedding dims kept: {train_emb.shape[1]}/{len(var)}")
     print(f"MolFormer train embedding variance mean: {float(train_emb.var(axis=0).mean()):.6e}")
     print(f"MolFormer train unique rows ratio: {np.unique(train_emb.round(6), axis=0).shape[0] / max(1, train_emb.shape[0]):.3f}")
@@ -548,6 +593,7 @@ def run_molformer_training() -> None:
     scaler = StandardScaler()
     train_x = scaler.fit_transform(train_emb)
     valid_x = scaler.transform(valid_emb)
+    test_x = scaler.transform(test_emb)
 
     clf = LogisticRegression(
         max_iter=5000,
@@ -556,10 +602,11 @@ def run_molformer_training() -> None:
         solver="saga",
     )
     clf.fit(train_x, y_train)
-    molformer_score = clf.predict_proba(valid_x)[:, 1]
+    molformer_score_valid = clf.predict_proba(valid_x)[:, 1]
+    molformer_score_test = clf.predict_proba(test_x)[:, 1]
 
     # If score collapses to near-constant, fallback to XGBoost on same embeddings.
-    if float(np.std(molformer_score)) < 1e-5:
+    if float(np.std(molformer_score_valid)) < 1e-5:
         print("MolFormer LR scores nearly constant, fallback to XGBoost classifier.")
         xgb = XGBClassifier(
             n_estimators=300,
@@ -573,10 +620,11 @@ def run_molformer_training() -> None:
             random_state=CONFIG["RANDOM_STATE"],
         )
         xgb.fit(train_x, y_train)
-        molformer_score = xgb.predict_proba(valid_x)[:, 1]
+        molformer_score_valid = xgb.predict_proba(valid_x)[:, 1]
+        molformer_score_test = xgb.predict_proba(test_x)[:, 1]
 
     # If still collapsed, fallback to RandomForest for robust non-linear decision boundary.
-    if float(np.std(molformer_score)) < 1e-5:
+    if float(np.std(molformer_score_valid)) < 1e-5:
         print("MolFormer XGBoost scores still nearly constant, fallback to RandomForest.")
         rf = RandomForestClassifier(
             n_estimators=500,
@@ -586,11 +634,13 @@ def run_molformer_training() -> None:
             n_jobs=-1,
         )
         rf.fit(train_x, y_train)
-        molformer_score = rf.predict_proba(valid_x)[:, 1]
+        molformer_score_valid = rf.predict_proba(valid_x)[:, 1]
+        molformer_score_test = rf.predict_proba(test_x)[:, 1]
 
     print(
         "MolFormer score distribution -> "
-        f"min: {molformer_score.min():.6f}, max: {molformer_score.max():.6f}, std: {molformer_score.std():.6f}"
+        f"valid min: {molformer_score_valid.min():.6f}, valid max: {molformer_score_valid.max():.6f}, valid std: {molformer_score_valid.std():.6f}, "
+        f"test min: {molformer_score_test.min():.6f}, test max: {molformer_score_test.max():.6f}, test std: {molformer_score_test.std():.6f}"
     )
 
     pred_dir = Path(CONFIG["PRED_DIR"])
@@ -599,18 +649,27 @@ def run_molformer_training() -> None:
         {
             "smiles": valid_df[smiles_col].astype(str).tolist(),
             "label": y_valid.tolist(),
-            "molformer_score": molformer_score,
+            "molformer_score": molformer_score_valid,
         }
-    ).to_csv(pred_dir / "molformer_predictions.csv", index=False)
-    print(f"Saved MolFormer predictions: {pred_dir / 'molformer_predictions.csv'}")
+    ).to_csv(pred_dir / "molformer_predictions_valid.csv", index=False)
+    pd.DataFrame(
+        {
+            "smiles": test_df[smiles_col].astype(str).tolist(),
+            "label": y_test.tolist(),
+            "molformer_score": molformer_score_test,
+        }
+    ).to_csv(pred_dir / "molformer_predictions_test.csv", index=False)
+    print(f"Saved MolFormer VALID predictions: {pred_dir / 'molformer_predictions_valid.csv'}")
+    print(f"Saved MolFormer TEST predictions: {pred_dir / 'molformer_predictions_test.csv'}")
 
 
 def run_benchmark() -> None:
     from evaluation.benchmark import run_benchmark
 
     pred_dir = Path(CONFIG["PRED_DIR"])
-    molformer_file = pred_dir / "molformer_predictions.csv"
-    if not molformer_file.exists():
+    molformer_valid_file = pred_dir / "molformer_predictions_valid.csv"
+    molformer_test_file = pred_dir / "molformer_predictions_test.csv"
+    if not molformer_valid_file.exists() or not molformer_test_file.exists():
         print("MolFormer predictions missing. Auto-running molformer_training before benchmark...")
         run_molformer_training()
 

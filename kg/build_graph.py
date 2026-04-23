@@ -24,7 +24,7 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from utils import stratified_scaffold_split
+from utils import stratified_scaffold_split_3way
 from config import CONFIG, resolve_domain_config_path
 
 
@@ -342,10 +342,11 @@ def main() -> None:
         df_experimental = pd.read_csv(EXPERIMENTAL_CSV)
         smiles_col = _detect_smiles_column(df_experimental)
         label_col = CONFIG.get("LABEL_COLUMN", "Label")
-        train_df, _ = stratified_scaffold_split(
+        train_df, _, _ = stratified_scaffold_split_3way(
             df=df_experimental,
             smiles_col=smiles_col,
             label_col=label_col,
+            valid_size=CONFIG.get("VALID_SIZE", 0.15),
             test_size=CONFIG.get("TEST_SIZE", 0.2),
             seed=CONFIG.get("RANDOM_STATE", 42),
         )

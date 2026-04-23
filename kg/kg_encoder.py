@@ -371,3 +371,44 @@ def build_train_and_valid_kg_features(
     train_out = np.concatenate([train_features, train_sim_stats, train_lbl_stats], axis=1)
     valid_out = np.concatenate([valid_features, valid_sim_stats, valid_lbl_stats], axis=1)
     return train_out, valid_out
+
+
+def build_train_valid_test_kg_features(
+    train_smiles: List[str],
+    valid_smiles: List[str],
+    test_smiles: List[str],
+    train_y: np.ndarray,
+    target_name: str = "EGFR",
+    top_k: int = 5,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    train_features = build_kg_statistical_features(train_smiles, target_name=target_name)
+    train_fps = [_fingerprint_or_none(s) for s in train_smiles]
+    valid_fps = [_fingerprint_or_none(s) for s in valid_smiles]
+    test_fps = [_fingerprint_or_none(s) for s in test_smiles]
+
+    valid_features = infer_valid_features_by_knn(
+        train_smiles=train_smiles,
+        train_features=train_features,
+        valid_smiles=valid_smiles,
+        top_k=top_k,
+    )
+    test_features = infer_valid_features_by_knn(
+        train_smiles=train_smiles,
+        train_features=train_features,
+        valid_smiles=test_smiles,
+        top_k=top_k,
+    )
+    # Add KNN similarity statistics to enrich train/valid/test representations.
+    train_sim_stats = _knn_similarity_stats(train_fps=train_fps, query_fps=train_fps, top_k=top_k, exclude_self=True)
+    valid_sim_stats = _knn_similarity_stats(train_fps=train_fps, query_fps=valid_fps, top_k=top_k, exclude_self=False)
+    test_sim_stats = _knn_similarity_stats(train_fps=train_fps, query_fps=test_fps, top_k=top_k, exclude_self=False)
+
+    # Add label-aware KNN stats (TRAIN labels only; safe against valid/test leakage).
+    train_lbl_stats = _knn_label_stats(train_fps=train_fps, train_y=train_y, query_fps=train_fps, top_k=top_k, exclude_self=True)
+    valid_lbl_stats = _knn_label_stats(train_fps=train_fps, train_y=train_y, query_fps=valid_fps, top_k=top_k, exclude_self=False)
+    test_lbl_stats = _knn_label_stats(train_fps=train_fps, train_y=train_y, query_fps=test_fps, top_k=top_k, exclude_self=False)
+
+    train_out = np.concatenate([train_features, train_sim_stats, train_lbl_stats], axis=1)
+    valid_out = np.concatenate([valid_features, valid_sim_stats, valid_lbl_stats], axis=1)
+    test_out = np.concatenate([test_features, test_sim_stats, test_lbl_stats], axis=1)
+    return train_out, valid_out, test_out
