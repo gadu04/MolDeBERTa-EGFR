@@ -1,27 +1,27 @@
 {
   "summary": {
     "MolDeBERTa": {
-      "threshold": 0.6199999999999998,
+      "threshold": 0.5099999999999998,
       "accuracy": 0.9354536950420954,
-      "f1_macro": 0.9353720307329165,
-      "mcc": 0.8707850883799164,
-      "roc_auc": 0.9734896293491523
+      "f1_macro": 0.9353339557881725,
+      "mcc": 0.870682697261657,
+      "roc_auc": 0.9743030137293676
     },
     "Pipeline_MolDeBERTa_plus_KG": {
-      "threshold": 0.45999999999999985,
-      "accuracy": 0.9335827876520112,
-      "f1_macro": 0.93353043846843,
-      "mcc": 0.8673374527448551,
-      "roc_auc": 0.9697540213443281
+      "threshold": 0.3899999999999999,
+      "accuracy": 0.9485500467726847,
+      "f1_macro": 0.9485147249025156,
+      "mcc": 0.8974035318498708,
+      "roc_auc": 0.9795146339069094
     },
     "meta_learner_coef": [
       [
-        5.882931392094868,
-        1.184895562824542
+        4.343311896933449,
+        3.404068532130637
       ]
     ],
     "meta_learner_intercept": [
-      -3.677703613933906
+      -3.750453857188501
     ],
     "MolFormer": {
       "threshold": 0.4199999999999998,
@@ -35,29 +35,29 @@
     {
       "bin": "Very Low",
       "n_samples": 69,
-      "auc_moldeberta": 0.702020202020202,
-      "auc_moldeberta_plus_kg": 0.787878787878788,
+      "auc_moldeberta": 0.6262626262626262,
+      "auc_moldeberta_plus_kg": 0.712121212121212,
       "auc_molformer": 0.5353535353535352
     },
     {
       "bin": "Low",
       "n_samples": 243,
-      "auc_moldeberta": 0.9419443949385137,
-      "auc_moldeberta_plus_kg": 0.9339689894849402,
+      "auc_moldeberta": 0.9441276064872572,
+      "auc_moldeberta_plus_kg": 0.9541971128141151,
       "auc_molformer": 0.9017109249688112
     },
     {
       "bin": "Medium",
       "n_samples": 465,
-      "auc_moldeberta": 0.9659576047815273,
-      "auc_moldeberta_plus_kg": 0.9597579537439209,
+      "auc_moldeberta": 0.9669877863162193,
+      "auc_moldeberta_plus_kg": 0.9732338419274603,
       "auc_molformer": 0.903868285258195
     },
     {
       "bin": "High",
       "n_samples": 292,
-      "auc_moldeberta": 0.9912816281628163,
-      "auc_moldeberta_plus_kg": 0.9857535753575357,
+      "auc_moldeberta": 0.9915841584158416,
+      "auc_moldeberta_plus_kg": 0.9876787678767875,
       "auc_molformer": 0.9455445544554455
     }
   ]

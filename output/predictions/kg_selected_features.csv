@@ -2,3 +2,7 @@ kept_feature
 knn_mean_sim
 knn_max_sim
 knn_std_sim
+knn_pos_rate
+knn_pos_rate_w
+knn_nearest_pos_sim
+knn_nearest_neg_sim

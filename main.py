@@ -12,11 +12,16 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
 from transformers import AutoModel, AutoModelForSequenceClassification, AutoTokenizer
+from transformers import Trainer, TrainingArguments
+from datasets import Dataset as HFDataset
+import inspect
 from sklearn.metrics import f1_score
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import StratifiedShuffleSplit
 from xgboost import XGBClassifier
+from rdkit import Chem
 
 from config import CONFIG
 from utils import detect_smiles_column, labels_to_int, stratified_scaffold_split
@@ -80,6 +85,75 @@ class SmilesDataset(Dataset):
         return item
 
 
+def _enumerate_smiles(smiles: str, n_random: int = 2, max_tries: int = 50) -> list[str]:
+    """
+    Generate up to `n_random` additional randomized SMILES (RDKit doRandom=True).
+    Falls back to canonical SMILES duplicates if enumeration fails.
+    """
+    mol = Chem.MolFromSmiles(str(smiles))
+    if mol is None:
+        return []
+    base = Chem.MolToSmiles(mol, canonical=True, isomericSmiles=False)
+    out: list[str] = []
+    seen = {base}
+    tries = 0
+    while len(out) < n_random and tries < max_tries:
+        tries += 1
+        try:
+            s = Chem.MolToSmiles(mol, doRandom=True, canonical=False, isomericSmiles=False)
+        except Exception:
+            continue
+        if not s or s in seen:
+            continue
+        # Validate generated SMILES round-trip.
+        if Chem.MolFromSmiles(s) is None:
+            continue
+        seen.add(s)
+        out.append(s)
+    # If RDKit couldn't produce enough random SMILES, duplicate canonical ones to keep 3x training size.
+    while len(out) < n_random:
+        out.append(base)
+    return out
+
+
+class FocalLossTrainer(Trainer):
+    """
+    HuggingFace Trainer with auto-adaptive focal loss for binary classification.
+    Dynamic alpha is computed per-batch from label counts:
+      alpha_pos = n_neg / n_total, alpha_neg = n_pos / n_total
+    """
+
+    def __init__(self, *args, gamma: float = 2.0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.gamma = float(gamma)
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        labels = inputs.get("labels")
+        outputs = model(**inputs)
+        logits = outputs.get("logits")
+        if labels is None or logits is None:
+            raise RuntimeError("FocalLossTrainer requires `labels` and model `logits`.")
+
+        labels = labels.view(-1).to(logits.device)
+        logits = logits.view(-1, logits.shape[-1])
+
+        # Compute per-batch class weights without peeking at validation/test.
+        n_total = max(int(labels.numel()), 1)
+        n_pos = int((labels == 1).sum().item())
+        n_neg = n_total - n_pos
+        alpha_pos = float(n_neg) / float(n_total)  # weight for positive samples
+        alpha_neg = float(n_pos) / float(n_total)  # weight for negative samples
+
+        logp = torch.log_softmax(logits, dim=-1)
+        logpt = logp.gather(1, labels.unsqueeze(1)).squeeze(1)
+        pt = logpt.exp()
+
+        alpha_t = torch.where(labels == 1, torch.tensor(alpha_pos, device=logits.device), torch.tensor(alpha_neg, device=logits.device))
+        loss = -alpha_t * ((1.0 - pt) ** self.gamma) * logpt
+        loss = loss.mean()
+        return (loss, outputs) if return_outputs else loss
+
+
 def run_finetuning() -> None:
     _log_torch_runtime("finetuning")
     train_df, valid_df, smiles_col, label_col = _load_and_split()
@@ -89,8 +163,6 @@ def run_finetuning() -> None:
     tokenizer = AutoTokenizer.from_pretrained(CONFIG["MODEL_PATH"])
     model = AutoModelForSequenceClassification.from_pretrained(CONFIG["MODEL_PATH"], num_labels=2)
     use_cuda = torch.cuda.is_available()
-    device = "cuda" if use_cuda else "cpu"
-    model.to(device)
     if use_cuda:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
@@ -98,78 +170,121 @@ def run_finetuning() -> None:
     else:
         print("  acceleration: CPU only")
 
-    train_ds = SmilesDataset(train_df[smiles_col].astype(str).tolist(), y_train.tolist(), tokenizer, CONFIG["BERT_MAX_LENGTH"])
-    valid_ds = SmilesDataset(valid_df[smiles_col].astype(str).tolist(), y_valid.tolist(), tokenizer, CONFIG["BERT_MAX_LENGTH"])
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=CONFIG["BERT_BATCH_SIZE"],
-        shuffle=True,
-        pin_memory=use_cuda,
+    # -----------------------
+    # Step 1) Train-only SMILES enumeration augmentation (triples train size).
+    # -----------------------
+    train_base_n = int(len(train_df))
+    aug_rows = []
+    for s, y in zip(train_df[smiles_col].astype(str).tolist(), y_train.tolist()):
+        for rs in _enumerate_smiles(s, n_random=2):
+            aug_rows.append({smiles_col: rs, label_col: y})
+    if aug_rows:
+        aug_df = pd.DataFrame(aug_rows)
+        # Ensure labels are represented consistently for downstream mapping.
+        aug_df[label_col] = aug_df[label_col].map(lambda v: "active" if int(v) == 1 else "inactive")
+        train_df_aug = pd.concat([train_df[[smiles_col, label_col]].copy(), aug_df], ignore_index=True)
+    else:
+        train_df_aug = train_df[[smiles_col, label_col]].copy()
+
+    y_train_aug = labels_to_int(train_df_aug[label_col])
+    print(
+        "Train augmentation (SMILES enumeration): "
+        f"original_train={train_base_n}, augmented_train={len(train_df_aug)} (target ~{train_base_n * 3})"
     )
-    valid_loader = DataLoader(
-        valid_ds,
-        batch_size=CONFIG["BERT_BATCH_SIZE"],
-        shuffle=False,
-        pin_memory=use_cuda,
-    )
+    n_pos = int((y_train_aug == 1).sum())
+    n_neg = int((y_train_aug == 0).sum())
+    alpha_pos = n_neg / max(n_pos + n_neg, 1)
+    alpha_neg = n_pos / max(n_pos + n_neg, 1)
+    print(f"FocalLoss dynamic alpha (from augmented train): alpha_pos={alpha_pos:.4f}, alpha_neg={alpha_neg:.4f}, gamma=2.0")
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=CONFIG["FINETUNE_LR"],
-        weight_decay=CONFIG["FINETUNE_WEIGHT_DECAY"],
-    )
+    # HuggingFace datasets + tokenizer
+    train_hf = HFDataset.from_pandas(pd.DataFrame({"smiles": train_df_aug[smiles_col].astype(str), "labels": y_train_aug}))
+    valid_hf = HFDataset.from_pandas(pd.DataFrame({"smiles": valid_df[smiles_col].astype(str), "labels": y_valid}))
 
-    best_f1 = -1.0
-    best_state = None
-    scaler = torch.amp.GradScaler("cuda", enabled=use_cuda)
-    for epoch in range(CONFIG["FINETUNE_EPOCHS"]):
-        model.train()
-        pbar = tqdm(train_loader, desc=f"Finetune epoch {epoch + 1}/{CONFIG['FINETUNE_EPOCHS']}", unit="batch")
-        for batch in pbar:
-            batch = {k: v.to(device, non_blocking=use_cuda) for k, v in batch.items()}
-            optimizer.zero_grad()
-            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_cuda):
-                out = model(**batch)
-                loss = out.loss
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            pbar.set_postfix(loss=f"{loss.item():.4f}")
+    def _tok(batch):
+        return tokenizer(
+            batch["smiles"],
+            truncation=True,
+            padding="max_length",
+            max_length=CONFIG["BERT_MAX_LENGTH"],
+        )
 
-        model.eval()
-        preds, refs = [], []
-        with torch.no_grad():
-            for batch in valid_loader:
-                labels = batch["labels"].numpy()
-                batch = {k: v.to(device, non_blocking=use_cuda) for k, v in batch.items()}
-                with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_cuda):
-                    logits = model(**batch).logits
-                pred = torch.argmax(logits, dim=1).cpu().numpy()
-                preds.extend(pred.tolist())
-                refs.extend(labels.tolist())
-        f1 = f1_score(refs, preds, average="macro")
-        print(f"Validation F1-macro epoch {epoch + 1}: {f1:.4f}")
-        if f1 > best_f1:
-            best_f1 = f1
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+    train_hf = train_hf.map(_tok, batched=True, remove_columns=["smiles"])
+    valid_hf = valid_hf.map(_tok, batched=True, remove_columns=["smiles"])
+    train_hf.set_format(type="torch")
+    valid_hf.set_format(type="torch")
 
-    if best_state is not None:
-        model.load_state_dict(best_state)
+    def _compute_metrics(eval_pred):
+        logits, labels = eval_pred
+        preds = np.argmax(logits, axis=1)
+        return {"f1_macro": float(f1_score(labels, preds, average="macro"))}
 
     finetuned_dir = Path(CONFIG["FINETUNED_DIR"])
     finetuned_dir.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(finetuned_dir)
+    # transformers version compatibility: only pass supported TrainingArguments kwargs
+    ta_sig = inspect.signature(TrainingArguments.__init__)
+    supported = set(ta_sig.parameters.keys())
+    args_kwargs = {
+        "output_dir": str(finetuned_dir / "trainer_runs"),
+        "num_train_epochs": CONFIG["FINETUNE_EPOCHS"],
+        "per_device_train_batch_size": CONFIG["BERT_BATCH_SIZE"],
+        "per_device_eval_batch_size": CONFIG["BERT_BATCH_SIZE"],
+        "learning_rate": CONFIG["FINETUNE_LR"],
+        "weight_decay": CONFIG["FINETUNE_WEIGHT_DECAY"],
+        "fp16": use_cuda,
+        "logging_steps": 50,
+        "seed": CONFIG["RANDOM_STATE"],
+        # Newer transformers
+        "evaluation_strategy": "epoch",
+        "save_strategy": "epoch",
+        "load_best_model_at_end": True,
+        "metric_for_best_model": "f1_macro",
+        "greater_is_better": True,
+        "report_to": [],
+        # Older transformers fallbacks
+        "do_eval": True,
+        "evaluate_during_training": True,
+    }
+    filtered = {k: v for k, v in args_kwargs.items() if k in supported}
+    if "evaluation_strategy" not in filtered and "do_eval" in supported:
+        filtered["do_eval"] = True
+
+    # Compatibility guard: some transformers versions require eval/save strategies to match
+    # when load_best_model_at_end=True. If we can't set evaluation strategy, disable it.
+    if filtered.get("load_best_model_at_end") is True:
+        eval_strat = filtered.get("evaluation_strategy", None)
+        save_strat = filtered.get("save_strategy", None)
+        if eval_strat is None or save_strat is None or eval_strat != save_strat:
+            print(
+                "TrainingArguments compatibility: disabling load_best_model_at_end "
+                f"(evaluation_strategy={eval_strat}, save_strategy={save_strat})"
+            )
+            filtered["load_best_model_at_end"] = False
+            # These are only meaningful with best-model loading.
+            filtered.pop("metric_for_best_model", None)
+            filtered.pop("greater_is_better", None)
+
+    args = TrainingArguments(**filtered)
+
+    trainer = FocalLossTrainer(
+        model=model,
+        args=args,
+        train_dataset=train_hf,
+        eval_dataset=valid_hf,
+        tokenizer=tokenizer,
+        compute_metrics=_compute_metrics,
+        gamma=2.0,
+    )
+    trainer.train()
+
+    # Save best model + tokenizer.
+    trainer.model.save_pretrained(finetuned_dir)
     tokenizer.save_pretrained(finetuned_dir)
 
-    model.eval()
-    probs = []
-    with torch.no_grad():
-        for batch in tqdm(valid_loader, desc="Predict MolDeBERTa on valid", unit="batch"):
-            batch = {k: v.to(device, non_blocking=use_cuda) for k, v in batch.items()}
-            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_cuda):
-                logits = model(**batch).logits
-            prob = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
-            probs.extend(prob.tolist())
+    # Predict probabilities on VALID only (no augmentation, no leakage).
+    pred_out = trainer.predict(valid_hf)
+    valid_logits = pred_out.predictions
+    probs = torch.softmax(torch.tensor(valid_logits), dim=1)[:, 1].cpu().numpy().tolist()
 
     pred_dir = Path(CONFIG["PRED_DIR"])
     pred_dir.mkdir(parents=True, exist_ok=True)
@@ -207,11 +322,16 @@ def run_kg_training() -> None:
     train_df, valid_df, smiles_col, label_col = _load_and_split()
     y_train = labels_to_int(train_df[label_col])
     y_valid = labels_to_int(valid_df[label_col])
+    n_pos = int((y_train == 1).sum())
+    n_neg = int((y_train == 0).sum())
+    pos_weight = float(n_neg) / float(max(n_pos, 1))
+    print(f"XGBoost dynamic scale_pos_weight (from train split): neg={n_neg}, pos={n_pos}, scale_pos_weight={pos_weight:.6f}")
 
     print("Extracting train KG features + inferring valid features via Top-K Tanimoto neighbors...")
     kg_train, kg_valid = build_train_and_valid_kg_features(
         train_smiles=train_df[smiles_col].astype(str).tolist(),
         valid_smiles=valid_df[smiles_col].astype(str).tolist(),
+        train_y=y_train,
         target_name="EGFR",
         top_k=5,
     )
@@ -227,6 +347,10 @@ def run_kg_training() -> None:
         "knn_mean_sim",
         "knn_max_sim",
         "knn_std_sim",
+        "knn_pos_rate",
+        "knn_pos_rate_w",
+        "knn_nearest_pos_sim",
+        "knn_nearest_neg_sim",
     ]
 
     print("KG feature diagnostics:")
@@ -248,19 +372,70 @@ def run_kg_training() -> None:
     print(f"  Kept KG features ({len(kept_cols)}): {kept_cols}")
     if dropped_cols:
         print(f"  Dropped constant KG features ({len(dropped_cols)}): {dropped_cols}")
+
+    # Early stopping split from TRAIN only (no validation leakage).
+    sss = StratifiedShuffleSplit(n_splits=1, test_size=0.15, random_state=CONFIG["RANDOM_STATE"])
+    tr_idx, es_idx = next(sss.split(kg_train, y_train))
+    x_tr, y_tr = kg_train[tr_idx], y_train[tr_idx]
+    x_es, y_es = kg_train[es_idx], y_train[es_idx]
+    print(f"KG XGB early-stopping split (train-only): train={len(tr_idx)}, holdout={len(es_idx)}")
+
     clf = XGBClassifier(
-        n_estimators=500,
-        max_depth=8,
+        n_estimators=2000,
+        max_depth=6,
         learning_rate=0.03,
         subsample=0.9,
         colsample_bytree=0.9,
         reg_lambda=1.0,
+        reg_alpha=0.0,
+        min_child_weight=1.0,
+        gamma=0.0,
+        scale_pos_weight=pos_weight,
+        tree_method="hist",
+        device="cuda:0" if torch.cuda.is_available() else "cpu",
+        eval_metric="logloss",
+        early_stopping_rounds=50,
+        random_state=CONFIG["RANDOM_STATE"],
+    )
+    clf.fit(
+        x_tr,
+        y_tr,
+        eval_set=[(x_es, y_es)],
+        verbose=False,
+    )
+    if hasattr(clf, "best_iteration") and clf.best_iteration is not None:
+        print(f"KG XGB best_iteration: {int(clf.best_iteration)}")
+
+    # Refit on full train split at best_iteration for stable final model.
+    best_n = int(getattr(clf, "best_iteration", 0) or 0) + 1
+    best_n = max(50, min(best_n, 2000))
+    clf = XGBClassifier(
+        n_estimators=best_n,
+        max_depth=6,
+        learning_rate=0.03,
+        subsample=0.9,
+        colsample_bytree=0.9,
+        reg_lambda=1.0,
+        reg_alpha=0.0,
+        min_child_weight=1.0,
+        gamma=0.0,
+        scale_pos_weight=pos_weight,
         tree_method="hist",
         device="cuda:0" if torch.cuda.is_available() else "cpu",
         eval_metric="logloss",
         random_state=CONFIG["RANDOM_STATE"],
     )
     clf.fit(kg_train, y_train)
+
+    if hasattr(clf, "feature_importances_"):
+        imp = np.asarray(clf.feature_importances_, dtype=np.float32)
+        topk = int(min(10, imp.size))
+        order = np.argsort(-imp)[:topk]
+        print("Top KG feature importances:")
+        for j in order.tolist():
+            name = kept_cols[j] if j < len(kept_cols) else f"f{j}"
+            print(f"  {name}: {float(imp[j]):.6f}")
+
     kg_probs = clf.predict_proba(kg_valid)[:, 1]
     print(f"KG score distribution -> min: {kg_probs.min():.6f}, max: {kg_probs.max():.6f}, std: {kg_probs.std():.6f}")
 
@@ -444,7 +619,11 @@ def run_benchmark() -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["buildkg", "finetuning", "molformer_training", "kg_training", "benchmark"], required=True)
+    parser.add_argument(
+        "--mode",
+        choices=["buildkg", "finetuning", "molformer_training", "kg_training", "benchmark", "all"],
+        required=True,
+    )
     args = parser.parse_args()
 
     if args.mode == "buildkg":
@@ -457,6 +636,18 @@ def main() -> None:
         run_kg_training()
     elif args.mode == "benchmark":
         run_benchmark()
+    elif args.mode == "all":
+        print("Running full pipeline (all modes) in order:")
+        steps = [
+            ("buildkg", run_buildkg),
+            ("molformer_training", run_molformer_training),
+            ("finetuning", run_finetuning),
+            ("kg_training", run_kg_training),
+            ("benchmark", run_benchmark),
+        ]
+        for name, fn in steps:
+            print(f"\n{'=' * 80}\nMODE: {name}\n{'=' * 80}")
+            fn()
 
 
 def _try_start_neo4j_docker() -> None:

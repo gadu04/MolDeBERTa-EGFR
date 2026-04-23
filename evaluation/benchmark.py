@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 from rdkit import DataStructs
 from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import StratifiedKFold, cross_val_predict
 from sklearn.metrics import accuracy_score, f1_score, matthews_corrcoef, roc_auc_score, roc_curve
 from tqdm.auto import tqdm
 
@@ -98,9 +99,13 @@ def run_benchmark() -> Dict:
     mol_score = merged["mol_score"].to_numpy(dtype=np.float32)
     kg_score = merged["kg_score"].to_numpy(dtype=np.float32)
 
+    # Meta-learner stacking without leakage: generate out-of-fold (OOF) probabilities on valid set.
+    X_meta = np.column_stack([mol_score, kg_score])
     meta = LogisticRegression(random_state=CONFIG["RANDOM_STATE"])
-    meta.fit(np.column_stack([mol_score, kg_score]), y_valid)
-    final_score = meta.predict_proba(np.column_stack([mol_score, kg_score]))[:, 1]
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=CONFIG["RANDOM_STATE"])
+    final_score = cross_val_predict(meta, X_meta, y_valid, cv=cv, method="predict_proba")[:, 1]
+    # Fit once on full valid set only for reporting coefficients (scores remain OOF).
+    meta.fit(X_meta, y_valid)
     method_scores: Dict[str, np.ndarray] = {
         "MolDeBERTa": mol_score,
         "MolDeBERTa + KG": final_score,

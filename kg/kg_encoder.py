@@ -281,9 +281,72 @@ def _knn_similarity_stats(
     return stats
 
 
+def _knn_label_stats(
+    train_fps: List,
+    train_y: np.ndarray,
+    query_fps: List,
+    top_k: int = 5,
+    exclude_self: bool = False,
+) -> np.ndarray:
+    """
+    Return per-query label-derived stats from Top-K similarities, using TRAIN labels only.
+    Output columns:
+      [knn_pos_rate, knn_pos_rate_w, knn_nearest_pos_sim, knn_nearest_neg_sim]
+    """
+    stats = np.zeros((len(query_fps), 4), dtype=np.float32)
+    valid_train = [fp for fp in train_fps if fp is not None]
+    valid_train_idx = np.array([i for i, fp in enumerate(train_fps) if fp is not None], dtype=np.int64)
+    if len(valid_train) == 0:
+        return stats
+
+    train_y = np.asarray(train_y).astype(np.int64, copy=False).reshape(-1)
+    for i, qfp in enumerate(query_fps):
+        if qfp is None:
+            continue
+        sims = np.array(DataStructs.BulkTanimotoSimilarity(qfp, valid_train), dtype=np.float32)
+        if exclude_self:
+            # Strict Leave-One-Out (LOO): remove identity molecule from its own neighbor pool.
+            # This prevents self-label leakage (the trivial neighbor with Tanimoto=1.0).
+            same_pos = np.where(valid_train_idx == i)[0]
+            if same_pos.size > 0:
+                sims[same_pos] = -1.0
+            # Also mask exact fingerprint matches (Tanimoto ~ 1.0) to avoid self-like shortcut.
+            sims[sims >= 0.999999] = -1.0
+
+        valid_mask = sims >= 0
+        if not np.any(valid_mask):
+            continue
+
+        k = int(max(1, min(top_k, int(valid_mask.sum()))))
+        top_pos = np.argpartition(sims, -k)[-k:]
+        top_pos = top_pos[sims[top_pos] >= 0]
+        if top_pos.size == 0:
+            continue
+
+        top_sims = sims[top_pos]
+        top_idx = valid_train_idx[top_pos]
+        top_y = train_y[top_idx]
+
+        # unweighted and similarity-weighted positive rates
+        stats[i, 0] = float(np.mean(top_y))
+        w = top_sims / max(float(np.sum(top_sims)), 1e-8)
+        stats[i, 1] = float(np.sum(w * top_y))
+
+        # nearest similarity to a positive/negative neighbor (within full train pool)
+        pos_mask = train_y[valid_train_idx] == 1
+        neg_mask = ~pos_mask
+        if np.any(pos_mask):
+            stats[i, 2] = float(np.max(sims[pos_mask])) if np.any(sims[pos_mask] >= 0) else 0.0
+        if np.any(neg_mask):
+            stats[i, 3] = float(np.max(sims[neg_mask])) if np.any(sims[neg_mask] >= 0) else 0.0
+
+    return stats
+
+
 def build_train_and_valid_kg_features(
     train_smiles: List[str],
     valid_smiles: List[str],
+    train_y: np.ndarray,
     target_name: str = "EGFR",
     top_k: int = 5,
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -301,6 +364,10 @@ def build_train_and_valid_kg_features(
     train_sim_stats = _knn_similarity_stats(train_fps=train_fps, query_fps=train_fps, top_k=top_k, exclude_self=True)
     valid_sim_stats = _knn_similarity_stats(train_fps=train_fps, query_fps=valid_fps, top_k=top_k, exclude_self=False)
 
-    train_out = np.concatenate([train_features, train_sim_stats], axis=1)
-    valid_out = np.concatenate([valid_features, valid_sim_stats], axis=1)
+    # Add label-aware KNN stats (TRAIN labels only; safe against validation leakage).
+    train_lbl_stats = _knn_label_stats(train_fps=train_fps, train_y=train_y, query_fps=train_fps, top_k=top_k, exclude_self=True)
+    valid_lbl_stats = _knn_label_stats(train_fps=train_fps, train_y=train_y, query_fps=valid_fps, top_k=top_k, exclude_self=False)
+
+    train_out = np.concatenate([train_features, train_sim_stats, train_lbl_stats], axis=1)
+    valid_out = np.concatenate([valid_features, valid_sim_stats, valid_lbl_stats], axis=1)
     return train_out, valid_out
