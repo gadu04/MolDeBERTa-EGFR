@@ -90,3 +90,9 @@ data/*.csv
 
 #Neo4J 
 neo4j_data/
+
+#Report
+report/
+
+#Chart Pipelines
+tools/
